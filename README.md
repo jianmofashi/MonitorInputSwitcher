@@ -275,9 +275,12 @@ left of `1` is saved as `²` on a French layout and as `` ` `` on a US one.
 
 These come from my monitor; yours may behave differently, and the app tries not to depend on them.
 
-- **Reading input `0x60` puts other data in the high byte.** For DisplayPort, Windows reads
-  `0x0F0F` and the raw Linux read gives `0x1B0F`. Only the low byte is the input, so a reading
-  matches an input when `reported == value || (reported & 0xFF) == value`.
+- **Reading input `0x60` sometimes returns a status instead of a code.** The AW3926QW puts other
+  data in the high byte (`0x1B0F` = DisplayPort); only the low byte is the input then. Some AOC
+  monitors (2490W1, Q27P1B) report DVI/HDMI as `0x0300`, DisplayPort as `0x0305`, and list only
+  VGA/DVI in their capabilities. Add HDMI (code 17) by hand in Settings if needed. The app can switch
+  to it, but the monitor does not distinguish DVI from HDMI when reading back, so the check mark
+  falls back to the last input the app switched to.
 
 ## Troubleshooting
 

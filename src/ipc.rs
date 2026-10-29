@@ -135,7 +135,13 @@ pub fn describe_input(config: &AppConfig, target: &Option<Target>, value: u32) -
             .iter()
             .find(|e| crate::ddc::matches(value, e.value))
     };
-    format!("{value} (0x{value:02X})") + &name.map(|e| format!(" = {}", e.name)).unwrap_or_default()
+    let name = name.map(|e| format!(" = {}", e.name)).unwrap_or_default();
+    if let Some(status) = crate::ddc::status_name(value) {
+        // AOC monitors report DVI/HDMI as one read-only status, not as an input code.
+        format!("{value} (0x{value:02X}), {status}")
+    } else {
+        format!("{value} (0x{value:02X}){name}")
+    }
 }
 
 /// The configured monitors: default marker, number, label, device and input count.
@@ -227,6 +233,15 @@ mod tests {
         let target = Some((Some("B".into()), Some("/dev/i2c-21".into())));
         assert!(describe_input(&config, &target, 17).contains("= HDMI-1"));
         assert!(!describe_input(&config, &target, 15).contains("= DisplayPort"));
+    }
+
+    #[test]
+    fn describes_aoc_status() {
+        let config = config();
+        let target = Some((Some("A".into()), Some("/dev/i2c-20".into())));
+        let text = describe_input(&config, &target, 0x0300);
+        assert!(text.contains("DVI/HDMI"), "{text}");
+        assert!(!text.contains("DVI-1"), "{text}");
     }
 
     #[test]

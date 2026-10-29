@@ -628,7 +628,7 @@ impl SettingsApp {
             .iter()
             .map(|(value, name)| format!("{name} ({value})"))
             .collect();
-        self.drafts[index].inputs_text = format!(
+        let mut text = format!(
             "The monitor lists {} input(s): {}. {}",
             found.len(),
             all.join(", "),
@@ -641,6 +641,16 @@ impl SettingsApp {
                 )
             }
         );
+        if !found
+            .iter()
+            .any(|(value, _)| matches!(*value, 0x11 | 0x12 | 0x0F))
+        {
+            text.push_str(
+                " If this monitor also has HDMI or DisplayPort, add it by hand (HDMI-1 = 17, \
+                 DisplayPort = 15): some monitors do not list every input.",
+            );
+        }
+        self.drafts[index].inputs_text = text;
     }
 
     /// The settings as currently shown in the form, checked the same way as an import.
@@ -749,8 +759,13 @@ impl eframe::App for SettingsApp {
                                     .find(|row| ddc::matches(v, row.value))
                                     .map(|row| format!(" = {}", row.name))
                                     .unwrap_or_default();
-                                draft.current_text =
-                                    format!("Current: {v} (0x{v:02X}){name}");
+                                draft.current_text = if let Some(status) = ddc::status_name(v) {
+                                    // AOC monitors report DVI/HDMI as a single status, not an
+                                    // input code, so there is nothing unambiguous to check.
+                                    format!("Current: {status}; raw reply {v} (0x{v:02X})")
+                                } else {
+                                    format!("Current: {v} (0x{v:02X}){name}")
+                                };
                             }
                             Err(e) => draft.current_text = format!("Error: {e}"),
                         }

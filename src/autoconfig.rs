@@ -63,11 +63,17 @@ pub fn detect_display(display: &DisplayInfo) -> Result<Detected, String> {
                 Err(e) => format!("Could not read the monitor's capabilities ({e})"),
             };
             match bus.get_vcp(INPUT_VCP) {
-                Ok(v) if !input_entries(&[v & 0xFF]).is_empty() => (
-                    vec![v & 0xFF],
-                    Some(format!("{why}; only the current input was added.")),
-                ),
-                Ok(_) => (Vec::new(), Some(format!("{why}; add inputs in Settings."))),
+                Ok(v) => {
+                    let input = v & 0xFF;
+                    if ddc::status_name(v).is_some() || input_entries(&[input]).is_empty() {
+                        (Vec::new(), Some(format!("{why}; add inputs in Settings.")))
+                    } else {
+                        (
+                            vec![input],
+                            Some(format!("{why}; only the current input was added.")),
+                        )
+                    }
+                }
                 Err(_) => (Vec::new(), Some(format!("{why}; add inputs in Settings."))),
             }
         }

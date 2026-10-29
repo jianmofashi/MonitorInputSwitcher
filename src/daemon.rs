@@ -365,7 +365,17 @@ impl App {
                 if self.last_known.len() <= i {
                     self.last_known.resize(i + 1, None);
                 }
-                self.last_known[i] = Some(value);
+                // AOC monitors report DVI/HDMI as one read-only status, and some monitors report
+                // an input that is not in their configured list. Keep the last switch in that
+                // case instead of losing the check mark.
+                if ddc::status_name(value).is_none()
+                    && self.config.monitors[i]
+                        .inputs
+                        .iter()
+                        .any(|entry| ddc::matches(value, entry.value))
+                {
+                    self.last_known[i] = Some(value);
+                }
             }
         }
         self.update_tray();
@@ -427,7 +437,17 @@ impl App {
         let last = self.last_known.get(monitor).copied().flatten();
         let tx = self.tx.clone();
         self.run_ddc(move |m| {
-            let current = m.get(Some(target.clone())).get_input().ok().or(last);
+            let current = m
+                .get(Some(target.clone()))
+                .get_input()
+                .ok()
+                .filter(|value| {
+                    ddc::status_name(*value).is_none()
+                        && inputs
+                            .iter()
+                            .any(|entry| ddc::matches(*value, entry.value))
+                })
+                .or(last);
             let result = crate::config::next_input(&inputs, current)
                 .cloned()
                 .and_then(|next| {

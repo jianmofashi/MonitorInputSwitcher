@@ -151,7 +151,12 @@ fn run_locally(cmd: &str, arg: &str, monitor_selector: Option<&str>) -> Result<S
                     config.monitors_summary()
                 ));
             }
-            let current = monitor.get_input().ok();
+            let current = monitor.get_input().ok().filter(|value| {
+                ddc::status_name(*value).is_none()
+                    && inputs
+                        .iter()
+                        .any(|entry| ddc::matches(*value, entry.value))
+            });
             let target = config::next_input(inputs, current)?;
             monitor.set_input(target.value)?;
             Ok(match profile {

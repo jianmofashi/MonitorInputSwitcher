@@ -63,9 +63,21 @@ impl DisplayInfo {
 }
 
 /// Some monitors (AW3926QW included) put other data in the high byte: DisplayPort reads as
-/// 0x0F0F on Windows and 0x1B0F on Linux.
+/// 0x0F0F on Windows and 0x1B0F on Linux. Only the low byte is the input then.
 pub fn matches(reported: u32, configured: u32) -> bool {
     reported == configured || (reported & 0xFF) == configured
+}
+
+/// Some AOC monitors (2490W1, Q27P1B, …) report a read-only status instead of the input code:
+/// 0x0300 means "DVI/HDMI" (they do not distinguish the two), 0x0301/0x0302 are transient values
+/// while switching, and 0x0305 means DisplayPort. Do not treat these as input codes.
+pub fn status_name(reported: u32) -> Option<&'static str> {
+    match reported {
+        0x0300 => Some("DVI/HDMI"),
+        0x0301 | 0x0302 => Some("switching to DVI/HDMI"),
+        0x0305 => Some("DisplayPort"),
+        _ => None,
+    }
 }
 
 // --- capabilities ----------------------------------------------------------------------------------
@@ -374,6 +386,16 @@ mod tests {
         assert!(matches(0x1B0F, 15) && !matches(0x1B0F, 27));
         assert!(matches(0x0F0F, 15));
         assert!(matches(27, 27));
+    }
+
+    #[test]
+    fn aoc_status_values() {
+        // The 2490W1 reports DVI/HDMI as 0x0300, not as input code 3 or 17.
+        assert!(!matches(0x0300, 3) && !matches(0x0300, 17));
+        assert_eq!(status_name(0x0300), Some("DVI/HDMI"));
+        assert_eq!(status_name(0x0301), Some("switching to DVI/HDMI"));
+        assert_eq!(status_name(0x0305), Some("DisplayPort"));
+        assert_eq!(status_name(1), None);
     }
 
     #[test]
