@@ -20,6 +20,11 @@ enum Ev {
     SettingsClosed,
     Ipc(Request, Reply),
     InputsKnown(Vec<(Target, u32)>),
+    /// One monitor's input from a "get" request, which should also refresh the tray check mark.
+    InputRead(Target, u32),
+    /// The input a "set" request just selected (Settings "Switch now"); remember it even if the
+    /// reply cannot tell which input is active.
+    InputSet(Target, u32),
     AutoConfigured(Result<Vec<autoconfig::Detected>, String>),
     SwitchDone {
         target: Target,
@@ -190,6 +195,12 @@ pub fn run() -> i32 {
     };
     app.update_tray();
     app.register_hotkeys(true);
+    // Read the current input now so the first tray menu already has the check mark. The read is
+    // asynchronous; if the menu is opened before it finishes, the next open shows it. On an
+    // unconfigured first run autoconfig will call `apply_config`, which reads it instead.
+    if !app.config.monitors.iter().all(|m| m.inputs.is_empty()) {
+        app.refresh_current_inputs();
+    }
 
     let ipc_tx = tx.clone();
     if let Err(e) = platform::ipc::listen(move |stream| {
@@ -279,6 +290,14 @@ impl App {
                     }
                 }
                 Ev::InputsKnown(values) => self.inputs_known(values),
+                Ev::InputRead(target, value) => {
+                    self.note_input(&target, value, false);
+                    self.update_tray();
+                }
+                Ev::InputSet(target, value) => {
+                    self.note_input(&target, value, true);
+                    self.update_tray();
+                }
                 Ev::SwitchDone {
                     target,
                     entry,
@@ -356,29 +375,36 @@ impl App {
     fn inputs_known(&mut self, values: Vec<(Target, u32)>) {
         self.refreshing = false;
         for (target, value) in values {
-            if let Some(i) = self
-                .config
-                .monitors
-                .iter()
-                .position(|m| ddc::target_matches(&m.target(), &target))
-            {
-                if self.last_known.len() <= i {
-                    self.last_known.resize(i + 1, None);
-                }
-                // AOC monitors report DVI/HDMI as one read-only status, and some monitors report
-                // an input that is not in their configured list. Keep the last switch in that
-                // case instead of losing the check mark.
-                if ddc::status_name(value).is_none()
-                    && self.config.monitors[i]
-                        .inputs
-                        .iter()
-                        .any(|entry| ddc::matches(value, entry.value))
-                {
-                    self.last_known[i] = Some(value);
-                }
-            }
+            self.note_input(&target, value, false);
         }
         self.update_tray();
+    }
+
+    /// Records a monitor's current input. A full read only counts when it matches a configured
+    /// input; a `set` request is trusted even before its input is saved, so a later save can show
+    /// the check mark. AOC monitors report DVI/HDMI as one read-only status, and some monitors
+    /// report an input that is not in their configured list; keep the last switch in that case.
+    fn note_input(&mut self, target: &Target, value: u32, trusted: bool) {
+        let Some(i) = self
+            .config
+            .monitors
+            .iter()
+            .position(|m| ddc::target_matches(&m.target(), target))
+        else {
+            return;
+        };
+        if self.last_known.len() <= i {
+            self.last_known.resize(i + 1, None);
+        }
+        if trusted
+            || (ddc::status_name(value).is_none()
+                && self.config.monitors[i]
+                    .inputs
+                    .iter()
+                    .any(|entry| ddc::matches(value, entry.value)))
+        {
+            self.last_known[i] = Some(value);
+        }
     }
 
     // --- switching -------------------------------------------------------------------------------
@@ -847,6 +873,8 @@ impl App {
         self.config = config;
         self.update_tray();
         self.register_hotkeys(true);
+        // New or changed monitors have no cached input yet; read it so the tray can show it.
+        self.refresh_current_inputs();
     }
 
     /// The monitor a request targets, or the first configured one.
@@ -916,12 +944,20 @@ impl App {
             "get" => {
                 let config = self.config.clone();
                 let target = self.requested_target(&req.monitor);
+                let tx = self.tx.clone();
                 self.run_ddc(move |m| {
                     let response = match m.get(target.clone()).get_input() {
-                        Ok(v) => Response {
-                            value: Some(v),
-                            ..Response::ok(ipc::describe_input(&config, &target, v))
-                        },
+                        Ok(v) => {
+                            // Also refresh the tray check mark: "Read current input" in Settings
+                            // and the CLI should make the known state visible immediately.
+                            if let Some(target) = target.clone() {
+                                let _ = tx.send(Ev::InputRead(target, v));
+                            }
+                            Response {
+                                value: Some(v),
+                                ..Response::ok(ipc::describe_input(&config, &target, v))
+                            }
+                        }
                         Err(e) => Response::err(e),
                     };
                     let _ = reply.send(response);
@@ -942,11 +978,21 @@ impl App {
             }
             "set" => {
                 let (target, value) = (req.monitor, req.value.unwrap_or(0));
+                let tx = self.tx.clone();
                 self.run_ddc(move |m| {
-                    let _ = reply.send(match m.get(target).set_input(value) {
-                        Ok(()) => Response::ok(format!("Set input {value}")),
+                    let response = match m.get(target.clone()).set_input(value) {
+                        Ok(()) => {
+                            // Settings' "Switch now" uses "set"; remember the new input so the
+                            // tray check mark follows it even when the monitor reports an
+                            // ambiguous status (AOC DVI/HDMI).
+                            if let Some(target) = target {
+                                let _ = tx.send(Ev::InputSet(target, value));
+                            }
+                            Response::ok(format!("Set input {value}"))
+                        }
                         Err(e) => Response::err(e),
-                    });
+                    };
+                    let _ = reply.send(response);
                 });
             }
             "list" => self.run_ddc(move |_| {

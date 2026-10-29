@@ -239,7 +239,9 @@ the top level) still loads: it is treated as a single monitor and rewritten in t
 next time the settings are saved.
 
 An exported settings file is this same JSON, so it can be imported on either system. "Start with
-login" isn't in it: that stays a per-computer choice.
+login" isn't in it: that stays a per-computer choice. The current input isn't in it either: it can
+change from the monitor's buttons or another computer, so the app reads it over DDC at startup and
+when the tray menu opens (and after "Read current input").
 
 ## Under the hood
 
