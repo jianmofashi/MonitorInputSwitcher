@@ -26,7 +26,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Reading Input Source (VCP `0x60`) often returns junk in the high byte (`0x1B0F`, `0x0F0F`); the low byte is the input then. Some AOC monitors instead return read-only status values: `0x0300` means DVI/HDMI (indistinguishable), `0x0305` means DisplayPort. Use `ddc::matches` for input codes and `ddc::status_name` for these; never plain equality or a raw low-byte mask.
 - Input codes, names and capabilities are per monitor — don't hard-code a model or assume the full MCCS table, or reuse one monitor's input list for another.
 - Cross-checking the Windows build from Linux without MSVC's `rc.exe` prints "Could not embed the Windows icon"; that's expected, not a failure.
-- Release: bump `version` in `Cargo.toml`, then push tag `v<version>` — CI fails if the tag and manifest version differ.
+- Release: bump `version` in `Cargo.toml`, then push tag `v<version>` — CI fails if the tag and manifest version differ. Fork releases may use independent tags such as `fork-0.0.1`, which skip that check.
 
 ## Repo etiquette
 

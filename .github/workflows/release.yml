@@ -1,5 +1,8 @@
 # Builds the Linux and Windows binaries and publishes them as a GitHub release when a version tag
 # is pushed:  git tag v1.0.0 && git push origin v1.0.0
+# Fork releases can use independent tags such as fork-0.0.1; those skip the Cargo.toml version
+# check because the fork numbering does not follow the upstream crate version:
+#   git tag fork-0.0.1 && git push origin fork-0.0.1
 # It can also be started by hand (Actions tab > Release > Run workflow, or `gh workflow run
 # release.yml`) to check that both builds pass: that builds, tests and keeps the binaries as run
 # artifacts, without publishing a release.
@@ -7,7 +10,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "fork-*"]
   workflow_dispatch:
 
 permissions:
@@ -27,7 +30,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check that the tag matches the version in Cargo.toml
-        if: github.ref_type == 'tag'
+        # fork-* tags have their own numbering; only upstream v* tags must match the crate version.
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)

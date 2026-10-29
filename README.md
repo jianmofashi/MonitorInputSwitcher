@@ -316,10 +316,11 @@ cargo check --target x86_64-pc-windows-msvc       # type-check the Windows build
 
 To publish a release, bump `version` in `Cargo.toml`, commit, then push a matching tag:
 `git tag v1.0.0 && git push origin v1.0.0`. The `Release` workflow (`.github/workflows/release.yml`)
-builds and tests both systems and attaches the binaries to a new GitHub release. To check that both
-builds pass before tagging, run it by hand with `gh workflow run release.yml` (or Actions > Release >
-Run workflow): it builds and tests without publishing anything, and keeps the binaries as artifacts
-of the run.
+builds and tests both systems and attaches the binaries to a new GitHub release. Fork releases can
+use their own tags such as `fork-0.0.1`; those are published the same way but skip the `Cargo.toml`
+version check. To check that both builds pass before tagging, run it by hand with
+`gh workflow run release.yml` (or Actions > Release > Run workflow): it builds and tests without
+publishing anything, and keeps the binaries as artifacts of the run.
 
 ```
 src/                  shared code: config, daemon, Settings window, CLI, capabilities parsing
