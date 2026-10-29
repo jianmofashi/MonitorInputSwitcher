@@ -27,10 +27,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     GetSystemMetrics, HICON, HMENU, IDI_APPLICATION, LR_DEFAULTCOLOR, LoadIconW, MF_CHECKED,
-    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, SetMenuDefaultItem, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, SetMenuDefaultItem,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
+    WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -38,11 +39,20 @@ const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_CALL: u32 = WM_APP + 2;
 const TRAY_ID: u32 = 1;
 
-const ID_NEXT: u32 = 10;
 const ID_SETTINGS: u32 = 11;
 const ID_STARTUP: u32 = 12;
 const ID_EXIT: u32 = 13;
-const ID_INPUT_BASE: u32 = 100;
+const ID_NEXT_BASE: u32 = 100;
+const ID_INPUT_BASE: u32 = 1000;
+const ID_INPUT_SPAN: u32 = 1000;
+
+fn input_menu_id(monitor: usize, input: usize) -> usize {
+    (ID_INPUT_BASE + monitor as u32 * ID_INPUT_SPAN + input as u32) as usize
+}
+
+fn next_menu_id(monitor: usize) -> usize {
+    (ID_NEXT_BASE + monitor as u32) as usize
+}
 
 /// Modifier virtual keys whose key-up we inject (L/R Shift, Ctrl, Alt, Win).
 const MODIFIER_VKS: [u16; 8] = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C];
@@ -169,28 +179,59 @@ impl State {
             None => text(name),
         };
         unsafe {
-            let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, &text(&m.header));
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            for (i, (name, hk, checked)) in m.inputs.iter().enumerate() {
-                let flags = if *checked {
-                    MF_STRING | MF_CHECKED
-                } else {
-                    MF_STRING
-                };
-                let _ = AppendMenuW(
-                    menu,
-                    flags,
-                    (ID_INPUT_BASE as usize) + i,
-                    &with_shortcut(name, hk),
-                );
-            }
-            if m.inputs.len() > 1 {
-                let _ = AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    ID_NEXT as usize,
-                    &with_shortcut("Next input", &m.toggle),
-                );
+            if let [monitor] = &m.monitors[..] {
+                // One configured monitor: keep the familiar flat menu.
+                let header = format!("Monitor: {}", monitor.label);
+                let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, &text(&header));
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                for (i, (name, hk, checked)) in monitor.inputs.iter().enumerate() {
+                    let flags = if *checked {
+                        MF_STRING | MF_CHECKED
+                    } else {
+                        MF_STRING
+                    };
+                    let _ = AppendMenuW(menu, flags, input_menu_id(0, i), &with_shortcut(name, hk));
+                }
+                if monitor.inputs.len() > 1 {
+                    let _ = AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        next_menu_id(0),
+                        &with_shortcut("Next input", &monitor.toggle),
+                    );
+                }
+            } else {
+                // Several monitors: one submenu each, so equal input names stay unambiguous.
+                for (monitor_index, monitor) in m.monitors.iter().enumerate() {
+                    let submenu = CreatePopupMenu().ok()?;
+                    for (input_index, (name, hk, checked)) in monitor.inputs.iter().enumerate() {
+                        let flags = if *checked {
+                            MF_STRING | MF_CHECKED
+                        } else {
+                            MF_STRING
+                        };
+                        let _ = AppendMenuW(
+                            submenu,
+                            flags,
+                            input_menu_id(monitor_index, input_index),
+                            &with_shortcut(name, hk),
+                        );
+                    }
+                    if monitor.inputs.len() > 1 {
+                        let _ = AppendMenuW(
+                            submenu,
+                            MF_STRING,
+                            next_menu_id(monitor_index),
+                            &with_shortcut("Next input", &monitor.toggle),
+                        );
+                    }
+                    let _ = AppendMenuW(
+                        menu,
+                        MF_POPUP,
+                        submenu.0 as usize,
+                        &text(&monitor.label),
+                    );
+                }
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS as usize, w!("Settings..."));
@@ -215,15 +256,35 @@ impl State {
     fn handle_command(&mut self, cmd: u32) {
         match cmd {
             0 => {}
-            ID_NEXT => self.send(UiEvent::Next),
             ID_SETTINGS => self.send(UiEvent::OpenSettings),
             ID_STARTUP => {
                 self.model.autostart = !self.model.autostart;
                 self.send(UiEvent::SetAutostart(self.model.autostart));
             }
             ID_EXIT => self.send(UiEvent::Quit),
-            c if c >= ID_INPUT_BASE && ((c - ID_INPUT_BASE) as usize) < self.model.inputs.len() => {
-                self.send(UiEvent::Switch((c - ID_INPUT_BASE) as usize))
+            c if c >= ID_INPUT_BASE => {
+                let n = c - ID_INPUT_BASE;
+                let monitor = (n / ID_INPUT_SPAN) as usize;
+                let input = (n % ID_INPUT_SPAN) as usize;
+                if self
+                    .model
+                    .monitors
+                    .get(monitor)
+                    .is_some_and(|m| input < m.inputs.len())
+                {
+                    self.send(UiEvent::Switch { monitor, input });
+                }
+            }
+            c if c >= ID_NEXT_BASE => {
+                let monitor = (c - ID_NEXT_BASE) as usize;
+                if self
+                    .model
+                    .monitors
+                    .get(monitor)
+                    .is_some_and(|m| m.inputs.len() > 1)
+                {
+                    self.send(UiEvent::Next { monitor });
+                }
             }
             _ => {}
         }

@@ -6,9 +6,11 @@ use super::kglobalaccel::{self, GlobalShortcuts};
 use super::qtkeys;
 use crate::config::{APP_ID, APP_NAME};
 use crate::hotkey::Hotkey;
-use crate::platform::{ICON_PNG, START_WITH_LOGIN, ShortcutAction, TrayModel, UiEvent};
+use crate::platform::{
+    ICON_PNG, START_WITH_LOGIN, ShortcutAction, TrayModel, TrayMonitor, UiEvent,
+};
 use ksni::blocking::TrayMethods;
-use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
+use ksni::menu::{CheckmarkItem, MenuItem, StandardItem, SubMenu};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use zbus::zvariant::Value;
@@ -48,43 +50,32 @@ impl ksni::Tray for Tray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let shortcut = |hk: &Option<Hotkey>| {
-            hk.as_ref()
-                .map(qtkeys::dbusmenu_shortcut)
-                .unwrap_or_default()
-        };
         let m = &self.model;
-        let mut items: Vec<MenuItem<Self>> = vec![
-            StandardItem {
-                label: m.header.replace('_', "__"),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-        ];
-        for (i, (name, hk, checked)) in m.inputs.iter().enumerate() {
-            items.push(
-                CheckmarkItem {
-                    label: name.replace('_', "__"),
-                    checked: *checked,
-                    shortcut: shortcut(hk),
-                    activate: Box::new(move |t: &mut Self| t.send(UiEvent::Switch(i))),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
-        if m.inputs.len() > 1 {
+        let mut items: Vec<MenuItem<Self>> = Vec::new();
+        if let [monitor] = &m.monitors[..] {
+            // One configured monitor: keep the familiar flat menu.
             items.push(
                 StandardItem {
-                    label: "Next input".into(),
-                    shortcut: shortcut(&m.toggle),
-                    activate: Box::new(|t: &mut Self| t.send(UiEvent::Next)),
+                    label: format!("Monitor: {}", monitor.label).replace('_', "__"),
+                    enabled: false,
                     ..Default::default()
                 }
                 .into(),
             );
+            items.push(MenuItem::Separator);
+            items.extend(monitor_menu(monitor, 0));
+        } else {
+            // Several monitors: one submenu each, so equal input names stay unambiguous.
+            for (monitor_index, monitor) in m.monitors.iter().enumerate() {
+                items.push(
+                    SubMenu {
+                        label: monitor.label.replace('_', "__"),
+                        submenu: monitor_menu(monitor, monitor_index),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
         }
         items.push(MenuItem::Separator);
         items.push(
@@ -120,6 +111,49 @@ impl ksni::Tray for Tray {
         );
         items
     }
+}
+
+/// Menu items for one monitor: its inputs, then "Next input" when there is more than one.
+fn monitor_menu(monitor: &TrayMonitor, monitor_index: usize) -> Vec<MenuItem<Tray>> {
+    let shortcut = |hk: &Option<Hotkey>| {
+        hk.as_ref()
+            .map(qtkeys::dbusmenu_shortcut)
+            .unwrap_or_default()
+    };
+    let mut items = Vec::new();
+    for (input_index, (name, hk, checked)) in monitor.inputs.iter().enumerate() {
+        items.push(
+            CheckmarkItem {
+                label: name.replace('_', "__"),
+                checked: *checked,
+                shortcut: shortcut(hk),
+                activate: Box::new(move |t: &mut Tray| {
+                    t.send(UiEvent::Switch {
+                        monitor: monitor_index,
+                        input: input_index,
+                    })
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+    }
+    if monitor.inputs.len() > 1 {
+        items.push(
+            StandardItem {
+                label: "Next input".into(),
+                shortcut: shortcut(&monitor.toggle),
+                activate: Box::new(move |t: &mut Tray| {
+                    t.send(UiEvent::Next {
+                        monitor: monitor_index,
+                    })
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+    }
+    items
 }
 
 fn tray_icons() -> Vec<ksni::Icon> {

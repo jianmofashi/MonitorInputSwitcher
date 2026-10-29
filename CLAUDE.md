@@ -12,15 +12,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Architecture
 
 - One crate: shared logic (config, daemon, egui Settings window, CLI) in `src/`, with every OS difference behind `src/platform/`. `src/platform/mod.rs` documents the exact contract each OS module must provide (`Ui`, `ddc`, `ipc`, autostart, …).
-- The tray app (`daemon.rs`) owns state on one event loop thread; DDC runs on a dedicated worker thread so operations never overlap. The Settings window is a separate child process (`monitor-input-switcher settings-window`) so the tray process stays small — it is not a second window in the daemon process.
-- CLI commands are sent to the running app over a Unix socket / named pipe and fall back to talking to the monitor directly when it isn't running.
+- `AppConfig` holds a `Monitors` list; every monitor has its own inputs and `ToggleHotkey`. Settings edits a list of monitor drafts (add/remove/reorder), and the tray shows one submenu per monitor when more than one is configured.
+- The tray app (`daemon.rs`) owns state on one event loop thread; DDC runs on a dedicated worker thread so operations never overlap. The worker caches one `Monitor` per `Target` (name/device), including displays the Settings window is just trying out. The Settings window is a separate child process (`monitor-input-switcher settings-window`) so the tray process stays small — it is not a second window in the daemon process.
+- CLI commands are sent to the running app over a Unix socket / named pipe and fall back to talking to the monitor directly when it isn't running. `switch`, `next`, `get` and `capabilities` take `--monitor`; without it they use the first configured monitor.
 - No logging framework: diagnostics are `eprintln!`. On Windows the binary is built with `windows_subsystem = "windows"`, so `platform::attach_console()` re-attaches CLI invocations to the parent console.
 
 ## Gotchas
 
-- Config JSON keys are PascalCase (`#[serde(rename_all = "PascalCase")]`, documented in the README). Every new field needs a serde default so existing `config.json` files still load after an upgrade.
+- Config JSON keys are PascalCase (`#[serde(rename_all = "PascalCase")]`, documented in the README). The current shape is `Monitors: [{ Name, Device, Inputs, ToggleHotkey }]`; old top-level `MonitorName`/`MonitorDevice`/`Inputs`/`ToggleHotkey` files are migrated by `ConfigWire`. Every new field needs a serde default so existing `config.json` files still load after an upgrade.
+- With several configured monitors, `Monitor` runs in strict mode: it never falls back to "the only DDC display" and every entry needs a `Name` or `Device`. Do not bring back an implicit single-display fallback for multi-monitor configs; it can switch the wrong monitor.
+- Input shortcuts and each monitor's Next shortcut share one global hotkey namespace; `AppConfig::check` rejects duplicates across monitors.
 - Reading Input Source (VCP `0x60`) often returns junk in the high byte (`0x1B0F`, `0x0F0F`); only the low byte is the input. Compare with `ddc::matches`, never plain equality.
-- Input codes, names and capabilities are per monitor — don't hard-code a model or assume the full MCCS table.
+- Input codes, names and capabilities are per monitor — don't hard-code a model or assume the full MCCS table, or reuse one monitor's input list for another.
 - Cross-checking the Windows build from Linux without MSVC's `rc.exe` prints "Could not embed the Windows icon"; that's expected, not a failure.
 - Release: bump `version` in `Cargo.toml`, then push tag `v<version>` — CI fails if the tag and manifest version differ.
 

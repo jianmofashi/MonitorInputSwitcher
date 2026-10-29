@@ -3,16 +3,14 @@
 //! It edits config.json, then asks the running app to reload. DDC operations (detect, read,
 //! "Switch now") go through the running app so they stay serialized with everything else.
 
-use crate::config::{APP_NAME, AppConfig, InputEntry, autostart};
-use crate::ddc::{self, DisplayInfo};
+use crate::config::{APP_NAME, AppConfig, InputEntry, MonitorConfig, autostart};
+use crate::ddc::{self, DisplayInfo, Target};
 use crate::hotkey::{DIGIT_ROW, Hotkey};
 use crate::ipc::{self, Request};
 use crate::platform::{self, ICON_PNG};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-
-type Target = (Option<String>, Option<String>);
 
 /// Scan codes of the punctuation keys (PC set 1, which Linux evdev codes match for these keys), by
 /// the egui key of their US-layout position.
@@ -38,6 +36,28 @@ struct Row {
     testing: bool,
 }
 
+/// One monitor being edited. Inputs and the Next shortcut belong to this draft only.
+struct MonitorDraft {
+    /// Stable for async messages, also survives reordering.
+    id: u64,
+    name: Option<String>,
+    device: Option<String>,
+    inputs: Vec<Row>,
+    toggle: Option<Hotkey>,
+    detecting: bool,
+    inputs_text: String,
+    current_text: String,
+}
+
+impl MonitorDraft {
+    fn target(&self) -> Target {
+        (
+            clean_target_part(&self.name),
+            clean_target_part(&self.device),
+        )
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Capture {
     Row(usize),
@@ -46,9 +66,19 @@ enum Capture {
 
 enum Msg {
     Displays(Result<Vec<DisplayInfo>, String>),
-    Current(Result<u32, String>),
-    Tested(usize, Result<(), String>),
-    Capabilities(Result<String, String>),
+    Current {
+        draft: u64,
+        result: Result<u32, String>,
+    },
+    Tested {
+        draft: u64,
+        row: usize,
+        result: Result<(), String>,
+    },
+    Capabilities {
+        draft: u64,
+        result: Result<String, String>,
+    },
     /// None: the file dialog was cancelled.
     Exported(Result<Option<PathBuf>, String>),
     Imported(Result<Option<(PathBuf, AppConfig)>, String>),
@@ -62,8 +92,8 @@ fn file_dialog(title: &str) -> rfd::FileDialog {
         .add_filter("Settings", &["json"])
 }
 
-fn rows_from(config: &AppConfig) -> Vec<Row> {
-    config
+fn rows_from(monitor: &MonitorConfig) -> Vec<Row> {
+    monitor
         .inputs
         .iter()
         .map(|e| Row {
@@ -76,30 +106,12 @@ fn rows_from(config: &AppConfig) -> Vec<Row> {
         .collect()
 }
 
-struct SettingsApp {
-    config: AppConfig,
-    rows: Vec<Row>,
-    toggle: Option<Hotkey>,
-    autostart: bool,
-    notifications: bool,
-    startup_notification: bool,
-    displays: Option<Vec<DisplayInfo>>,
-    /// (label, target) entries of the monitor picker.
-    monitors: Vec<(String, Target)>,
-    selected: usize,
-    current_text: String,
-    inputs_text: String,
-    detecting: bool,
-    /// Content height the window was last grown to fit (see `fit_to_content`).
-    fitted_height: f32,
-    error: Option<String>,
-    /// Outcome of the last import or export.
-    status: Option<String>,
-    /// An import or export file dialog is open.
-    file_dialog: bool,
-    capture: Option<Capture>,
-    tx: Sender<Msg>,
-    rx: Receiver<Msg>,
+fn clean_target_part(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 // --- DDC through the running app, or directly when it isn't running ----------------------------
@@ -125,7 +137,9 @@ fn get_input(target: Target) -> Result<u32, String> {
         ..Default::default()
     }) {
         Some(r) => r.and_then(|r| r.value.ok_or_else(|| "No value returned".into())),
-        None => ddc::Monitor::new(target.0, target.1).get_input(),
+        None => ddc::Monitor::new(target.0, target.1)
+            .with_strict(true)
+            .get_input(),
     }
 }
 
@@ -136,7 +150,9 @@ fn capabilities(target: Target) -> Result<String, String> {
         ..Default::default()
     }) {
         Some(r) => r.and_then(|r| r.caps.ok_or_else(|| "No capabilities returned".into())),
-        None => ddc::Monitor::new(target.0, target.1).capabilities(),
+        None => ddc::Monitor::new(target.0, target.1)
+            .with_strict(true)
+            .capabilities(),
     }
 }
 
@@ -148,8 +164,33 @@ fn set_input(target: Target, value: u32) -> Result<(), String> {
         ..Default::default()
     }) {
         Some(r) => r.map(|_| ()),
-        None => ddc::Monitor::new(target.0, target.1).set_input(value),
+        None => ddc::Monitor::new(target.0, target.1)
+            .with_strict(true)
+            .set_input(value),
     }
+}
+
+struct SettingsApp {
+    /// The loaded config, used as the base for export/save (keeps unknown global fields).
+    config: AppConfig,
+    drafts: Vec<MonitorDraft>,
+    selected: usize,
+    autostart: bool,
+    notifications: bool,
+    startup_notification: bool,
+    displays: Option<Vec<DisplayInfo>>,
+    displays_error: Option<String>,
+    next_id: u64,
+    /// Content height the window was last grown to fit (see `fit_to_content`).
+    fitted_height: f32,
+    error: Option<String>,
+    /// Outcome of the last import or export.
+    status: Option<String>,
+    /// An import or export file dialog is open.
+    file_dialog: bool,
+    capture: Option<Capture>,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
 }
 
 impl SettingsApp {
@@ -157,18 +198,15 @@ impl SettingsApp {
         let config = AppConfig::load_or_default();
         let (tx, rx) = mpsc::channel();
         let mut app = SettingsApp {
-            rows: rows_from(&config),
-            toggle: Hotkey::parse_opt(&config.toggle_hotkey),
+            drafts: Vec::new(),
+            selected: 0,
             autostart: autostart::is_enabled(),
             notifications: config.show_notifications,
             startup_notification: config.show_startup_notification,
-            config,
+            config: config.clone(),
             displays: None,
-            monitors: Vec::new(),
-            selected: 0,
-            current_text: String::new(),
-            inputs_text: String::new(),
-            detecting: false,
+            displays_error: None,
+            next_id: 0,
             fitted_height: 0.0,
             error: None,
             status: None,
@@ -177,24 +215,59 @@ impl SettingsApp {
             tx,
             rx,
         };
-        app.fill_monitors(&[]);
+        app.drafts = app.drafts_from(&config);
         app.load_monitors(ctx);
         app
+    }
+
+    fn new_draft_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    fn drafts_from(&mut self, config: &AppConfig) -> Vec<MonitorDraft> {
+        let mut drafts: Vec<MonitorDraft> = config
+            .monitors
+            .iter()
+            .map(|monitor| MonitorDraft {
+                id: {
+                    self.next_id += 1;
+                    self.next_id
+                },
+                name: monitor.name.clone(),
+                device: monitor.device.clone(),
+                inputs: rows_from(monitor),
+                toggle: Hotkey::parse_opt(&monitor.toggle_hotkey),
+                detecting: false,
+                inputs_text: String::new(),
+                current_text: String::new(),
+            })
+            .collect();
+        if drafts.is_empty() {
+            let id = self.new_draft_id();
+            drafts.push(MonitorDraft {
+                id,
+                name: None,
+                device: None,
+                inputs: Vec::new(),
+                toggle: None,
+                detecting: false,
+                inputs_text: String::new(),
+                current_text: String::new(),
+            });
+        }
+        drafts
     }
 
     /// Shows imported settings in the form; they are applied on Save. "Start with login" is
     /// per machine and not part of the file, so it stays as it is.
     fn load_form(&mut self, config: AppConfig) {
         self.set_capture(None);
-        self.rows = rows_from(&config);
-        self.toggle = Hotkey::parse_opt(&config.toggle_hotkey);
+        self.drafts = self.drafts_from(&config);
+        self.selected = 0;
         self.notifications = config.show_notifications;
         self.startup_notification = config.show_startup_notification;
         self.config = config;
-        let displays = self.displays.clone().unwrap_or_default();
-        self.fill_monitors(&displays);
-        self.inputs_text.clear();
-        self.current_text.clear();
     }
 
     fn export(&mut self, ctx: &egui::Context) {
@@ -237,58 +310,107 @@ impl SettingsApp {
 
     fn load_monitors(&mut self, ctx: &egui::Context) {
         self.displays = None;
+        self.displays_error = None;
         self.spawn(ctx, || Msg::Displays(list_displays()));
     }
 
-    fn fill_monitors(&mut self, displays: &[DisplayInfo]) {
-        let (name, device) = (
-            self.config
-                .monitor_name
-                .clone()
-                .unwrap_or_default()
-                .to_lowercase(),
-            self.config.monitor_device.clone(),
-        );
-        self.monitors = displays
-            .iter()
-            .map(|d| (d.label(), (Some(d.model.clone()), Some(d.bus.clone()))))
-            .collect();
-        let found = displays
-            .iter()
-            .position(|d| {
-                d.model.to_lowercase() == name && device.as_ref().is_none_or(|dev| *dev == d.bus)
-            })
-            .or_else(|| displays.iter().position(|d| d.model.to_lowercase() == name));
-        self.selected = match found {
-            Some(i) => i,
-            None if self.config.monitor_name.is_some() || self.config.monitor_device.is_some() => {
-                let label = self
-                    .config
-                    .monitor_name
-                    .clone()
-                    .or(self.config.monitor_device.clone())
-                    .unwrap_or_default();
-                self.monitors.push((
-                    format!("{label}  (not detected)"),
-                    (
-                        self.config.monitor_name.clone(),
-                        self.config.monitor_device.clone(),
-                    ),
-                ));
-                self.monitors.len() - 1
-            }
-            None => 0,
-        };
+    fn target(&self) -> Target {
+        self.drafts
+            .get(self.selected)
+            .map(MonitorDraft::target)
+            .unwrap_or_default()
     }
 
-    fn target(&self) -> Target {
-        self.monitors
+    fn draft_id(&self, index: usize) -> u64 {
+        self.drafts.get(index).map_or(0, |d| d.id)
+    }
+
+    fn draft_label(&self, index: usize) -> String {
+        let Some(draft) = self.drafts.get(index) else {
+            return String::new();
+        };
+        let name = draft
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .or_else(|| draft.device.clone())
+            .unwrap_or_else(|| "(new monitor)".into());
+        format!("{}. {name}", index + 1)
+    }
+
+    /// DDC-capable displays not already assigned to a draft.
+    fn available_displays(&self) -> Vec<DisplayInfo> {
+        let displays = self.displays.as_deref().unwrap_or(&[]);
+        displays
+            .iter()
+            .filter(|display| {
+                display.valid
+                    && !self.drafts.iter().any(|draft| {
+                        draft.device.as_deref() == Some(display.bus.as_str())
+                            || (draft.device.is_none()
+                                && draft.name.as_deref().is_some_and(|name| {
+                                    name.eq_ignore_ascii_case(&display.model)
+                                }))
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The target shown in the picker. A legacy name-only target follows the matching detected
+    /// display, without changing the saved device unless the user picks a display.
+    fn picker_target(&self) -> Target {
+        self.drafts
             .get(self.selected)
-            .map(|(_, t)| t.clone())
-            .unwrap_or((
-                self.config.monitor_name.clone(),
-                self.config.monitor_device.clone(),
-            ))
+            .map(|draft| self.resolved_target(draft))
+            .unwrap_or_default()
+    }
+
+    /// Fills in the device for a name-only target when exactly one detected display matches. This
+    /// keeps the old Settings behaviour (picking a detected monitor saved its device) and makes
+    /// multi-monitor entries unambiguous.
+    fn resolved_target(&self, draft: &MonitorDraft) -> Target {
+        let (name, device) = draft.target();
+        if device.is_none()
+            && let Some(name) = name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            && let Some(display) = self
+                .displays
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .find(|display| display.model.eq_ignore_ascii_case(name))
+        {
+            return (
+                Some(display.model.clone()).filter(|model| !model.is_empty()),
+                Some(display.bus.clone()).filter(|bus| !bus.is_empty()),
+            );
+        }
+        (name, device)
+    }
+
+    /// The target picker entries for the selected draft, including a "(not detected)" entry.
+    fn display_options(&self) -> Vec<(String, Target)> {
+        let current = self.picker_target();
+        let mut options = Vec::new();
+        if current == (None, None) {
+            options.push(("(choose a monitor)".to_string(), current.clone()));
+        }
+        for display in self.displays.as_deref().unwrap_or(&[]) {
+            let target = (
+                Some(display.model.clone()).filter(|m| !m.is_empty()),
+                Some(display.bus.clone()).filter(|b| !b.is_empty()),
+            );
+            options.push((display.label(), target));
+        }
+        if current != (None, None) && !options.iter().any(|(_, target)| *target == current) {
+            options.push(("(not detected)".to_string(), current));
+        }
+        options
     }
 
     fn set_capture(&mut self, capture: Option<Capture>) {
@@ -314,12 +436,20 @@ impl SettingsApp {
                 continue;
             };
             let plain = !(modifiers.ctrl || modifiers.alt || modifiers.shift);
+            let selected = self.selected;
             let slot = match capture {
-                Capture::Row(i) => match self.rows.get_mut(i) {
-                    Some(r) => &mut r.hotkey,
+                Capture::Row(i) => match self
+                    .drafts
+                    .get_mut(selected)
+                    .and_then(|d| d.inputs.get_mut(i))
+                {
+                    Some(row) => &mut row.hotkey,
                     None => return self.set_capture(None),
                 },
-                Capture::Toggle => &mut self.toggle,
+                Capture::Toggle => match self.drafts.get_mut(selected) {
+                    Some(draft) => &mut draft.toggle,
+                    None => return self.set_capture(None),
+                },
             };
             match key {
                 egui::Key::Escape if plain => {}
@@ -359,8 +489,15 @@ impl SettingsApp {
     fn hotkey_button(&mut self, ui: &mut egui::Ui, which: Capture) {
         let recording = self.capture == Some(which);
         let value = match which {
-            Capture::Row(i) => &self.rows[i].hotkey,
-            Capture::Toggle => &self.toggle,
+            Capture::Row(i) => self
+                .drafts
+                .get(self.selected)
+                .and_then(|draft| draft.inputs.get(i))
+                .and_then(|row| row.hotkey.clone()),
+            Capture::Toggle => self
+                .drafts
+                .get(self.selected)
+                .and_then(|draft| draft.toggle.clone()),
         };
         let text = if recording {
             "Press keys... (Esc cancels)".to_string()
@@ -380,35 +517,105 @@ impl SettingsApp {
         }
     }
 
+    fn add_monitor(&mut self, ctx: &egui::Context, display: Option<&DisplayInfo>) {
+        let id = self.new_draft_id();
+        let (name, device) = match display {
+            Some(display) => (
+                Some(display.model.clone()).filter(|m| !m.is_empty()),
+                Some(display.bus.clone()).filter(|b| !b.is_empty()),
+            ),
+            None => (None, None),
+        };
+        let detecting = display.is_some();
+        self.drafts.push(MonitorDraft {
+            id,
+            name,
+            device,
+            inputs: Vec::new(),
+            toggle: None,
+            detecting,
+            inputs_text: if detecting {
+                "Detecting inputs...".to_string()
+            } else {
+                String::new()
+            },
+            current_text: String::new(),
+        });
+        self.selected = self.drafts.len() - 1;
+        self.set_capture(None);
+        if detecting {
+            let target = self.target();
+            self.spawn(ctx, move || Msg::Capabilities {
+                draft: id,
+                result: capabilities(target),
+            });
+        }
+    }
+
+    fn remove_selected(&mut self) {
+        if self.drafts.len() <= 1 {
+            return;
+        }
+        self.drafts.remove(self.selected);
+        self.selected = self.selected.min(self.drafts.len() - 1);
+        self.set_capture(None);
+    }
+
+    fn move_selected(&mut self, up: bool) {
+        let other = if up {
+            self.selected.checked_sub(1)
+        } else {
+            (self.selected + 1 < self.drafts.len()).then_some(self.selected + 1)
+        };
+        if let Some(other) = other {
+            self.drafts.swap(self.selected, other);
+            self.selected = other;
+            self.set_capture(None);
+        }
+    }
+
+    fn used_hotkeys(&self) -> Vec<Hotkey> {
+        self.drafts
+            .iter()
+            .flat_map(|draft| {
+                draft
+                    .inputs
+                    .iter()
+                    .filter_map(|row| row.hotkey.clone())
+                    .chain(draft.toggle.clone())
+            })
+            .collect()
+    }
+
+    fn free_default_hotkey(&self) -> Option<Hotkey> {
+        let used = self.used_hotkeys();
+        (0..9)
+            .filter_map(|i| crate::autoconfig::default_hotkey(i).and_then(|h| Hotkey::parse(&h)))
+            .find(|hotkey| !used.contains(hotkey))
+    }
+
     /// Adds a row for every input the monitor lists that isn't configured yet.
-    fn add_detected_inputs(&mut self, caps: &str) {
+    fn add_detected_inputs(&mut self, draft_id: u64, caps: &str) {
+        let Some(index) = self.drafts.iter().position(|draft| draft.id == draft_id) else {
+            return;
+        };
         let found = crate::autoconfig::input_entries(&ddc::caps_inputs(caps));
         if found.is_empty() {
-            self.inputs_text =
+            self.drafts[index].inputs_text =
                 "The monitor's capabilities list no input codes; add them by hand.".into();
             return;
         }
         let mut added = Vec::new();
         for (value, name) in &found {
-            if self
-                .rows
+            if self.drafts[index]
+                .inputs
                 .iter()
-                .any(|r| r.value == *value || ddc::matches(r.value, *value))
+                .any(|row| row.value == *value || ddc::matches(row.value, *value))
             {
                 continue;
             }
-            let used: Vec<Hotkey> = self
-                .rows
-                .iter()
-                .filter_map(|r| r.hotkey.clone())
-                .chain(self.toggle.clone())
-                .collect();
-            let hotkey = (0..9)
-                .filter_map(|i| {
-                    crate::autoconfig::default_hotkey(i).and_then(|h| Hotkey::parse(&h))
-                })
-                .find(|h| !used.contains(h));
-            self.rows.push(Row {
+            let hotkey = self.free_default_hotkey();
+            self.drafts[index].inputs.push(Row {
                 name: name.clone(),
                 value: *value,
                 hotkey,
@@ -417,8 +624,11 @@ impl SettingsApp {
             });
             added.push(name.clone());
         }
-        let all: Vec<String> = found.iter().map(|(v, n)| format!("{n} ({v})")).collect();
-        self.inputs_text = format!(
+        let all: Vec<String> = found
+            .iter()
+            .map(|(value, name)| format!("{name} ({value})"))
+            .collect();
+        self.drafts[index].inputs_text = format!(
             "The monitor lists {} input(s): {}. {}",
             found.len(),
             all.join(", "),
@@ -435,21 +645,29 @@ impl SettingsApp {
 
     /// The settings as currently shown in the form, checked the same way as an import.
     fn form_config(&self) -> Result<AppConfig, String> {
-        let (name, device) = self.target();
         let mut cfg = self.config.clone();
-        cfg.monitor_name = name;
-        cfg.monitor_device = device;
-        cfg.inputs = self
-            .rows
+        cfg.monitors = self
+            .drafts
             .iter()
-            .map(|r| InputEntry {
-                name: r.name.trim().into(),
-                value: r.value,
-                hotkey: r.hotkey.as_ref().map(Hotkey::to_string),
-                include_in_next: r.in_next,
+            .map(|draft| {
+                let (name, device) = self.resolved_target(draft);
+                MonitorConfig::new(
+                    name,
+                    device,
+                    draft
+                        .inputs
+                        .iter()
+                        .map(|row| InputEntry {
+                            name: row.name.trim().into(),
+                            value: row.value,
+                            hotkey: row.hotkey.as_ref().map(Hotkey::to_string),
+                            include_in_next: row.in_next,
+                        })
+                        .collect(),
+                    draft.toggle.as_ref().map(Hotkey::to_string),
+                )
             })
             .collect();
-        cfg.toggle_hotkey = self.toggle.as_ref().map(Hotkey::to_string);
         cfg.show_notifications = self.notifications;
         cfg.show_startup_notification = self.startup_notification;
         cfg.check()?;
@@ -513,38 +731,53 @@ impl eframe::App for SettingsApp {
         let ctx = ui.ctx().clone();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Displays(Ok(d)) => {
-                    self.fill_monitors(&d);
-                    self.displays = Some(d);
+                Msg::Displays(Ok(displays)) => {
+                    self.displays = Some(displays);
+                    self.displays_error = None;
                 }
                 Msg::Displays(Err(e)) => {
-                    self.fill_monitors(&[]);
                     self.displays = Some(Vec::new());
-                    self.current_text = format!("Detection failed: {e}");
+                    self.displays_error = Some(format!("Detection failed: {e}"));
                 }
-                Msg::Current(Ok(v)) => {
-                    let name = self
-                        .rows
-                        .iter()
-                        .find(|r| ddc::matches(v, r.value))
-                        .map(|r| format!(" = {}", r.name))
-                        .unwrap_or_default();
-                    self.current_text = format!("Current: {v} (0x{v:02X}){name}");
-                }
-                Msg::Current(Err(e)) => self.current_text = format!("Error: {e}"),
-                Msg::Capabilities(result) => {
-                    self.detecting = false;
-                    match result {
-                        Ok(caps) => self.add_detected_inputs(&caps),
-                        Err(e) => {
-                            self.inputs_text =
-                                format!("Could not read the monitor's capabilities: {e}")
+                Msg::Current { draft, result } => {
+                    if let Some(draft) = self.drafts.iter_mut().find(|d| d.id == draft) {
+                        match result {
+                            Ok(v) => {
+                                let name = draft
+                                    .inputs
+                                    .iter()
+                                    .find(|row| ddc::matches(v, row.value))
+                                    .map(|row| format!(" = {}", row.name))
+                                    .unwrap_or_default();
+                                draft.current_text =
+                                    format!("Current: {v} (0x{v:02X}){name}");
+                            }
+                            Err(e) => draft.current_text = format!("Error: {e}"),
                         }
                     }
                 }
-                Msg::Tested(i, result) => {
-                    if let Some(r) = self.rows.get_mut(i) {
-                        r.testing = false;
+                Msg::Capabilities { draft, result } => {
+                    if !self.drafts.iter().any(|d| d.id == draft) {
+                        continue;
+                    }
+                    if let Some(draft) = self.drafts.iter_mut().find(|d| d.id == draft) {
+                        draft.detecting = false;
+                    }
+                    match result {
+                        Ok(caps) => self.add_detected_inputs(draft, &caps),
+                        Err(e) => {
+                            if let Some(draft) = self.drafts.iter_mut().find(|d| d.id == draft) {
+                                draft.inputs_text =
+                                    format!("Could not read the monitor's capabilities: {e}");
+                            }
+                        }
+                    }
+                }
+                Msg::Tested { draft, row, result } => {
+                    if let Some(draft) = self.drafts.iter_mut().find(|d| d.id == draft) {
+                        if let Some(row) = draft.inputs.get_mut(row) {
+                            row.testing = false;
+                        }
                     }
                     if let Err(e) = result {
                         self.error = Some(format!("Switch failed: {e}"));
@@ -626,90 +859,240 @@ impl eframe::App for SettingsApp {
 
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
-                    ui.strong("Monitor");
-                    ui.horizontal(|ui| {
-                        let label = if self.displays.is_none() {
-                            "Detecting displays...".to_string()
-                        } else {
-                            self.monitors.get(self.selected).map(|m| m.0.clone()).unwrap_or_else(|| "(no displays)".into())
-                        };
-                        ui.add_enabled_ui(self.displays.is_some(), |ui| {
-                            egui::ComboBox::from_id_salt("monitor").width(330.0).selected_text(label).show_ui(ui, |ui| {
-                                for (i, (text, _)) in self.monitors.iter().enumerate() {
-                                    ui.selectable_value(&mut self.selected, i, text);
+                    ui.strong("Monitors");
+                    let labels: Vec<String> =
+                        (0..self.drafts.len()).map(|i| self.draft_label(i)).collect();
+                    let available = self.available_displays();
+                    let displays_ready = self.displays.is_some();
+                    let mut selected = self.selected;
+                    let mut add: Option<Option<DisplayInfo>> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        egui::ComboBox::from_id_salt("monitor")
+                            .width(260.0)
+                            .selected_text(
+                                labels.get(self.selected).cloned().unwrap_or_default(),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (i, label) in labels.iter().enumerate() {
+                                    ui.selectable_value(&mut selected, i, label);
                                 }
                             });
-                        });
+                        egui::ComboBox::from_id_salt("add_monitor")
+                            .width(200.0)
+                            .selected_text("Add monitor...")
+                            .show_ui(ui, |ui| {
+                                if !displays_ready {
+                                    ui.label("Detecting displays...");
+                                }
+                                for display in &available {
+                                    if ui.selectable_label(false, display.label()).clicked() {
+                                        add = Some(Some(display.clone()));
+                                    }
+                                }
+                                if ui.selectable_label(false, "Blank monitor").clicked() {
+                                    add = Some(None);
+                                }
+                            });
                         if ui.button("Refresh").clicked() {
                             self.load_monitors(&ctx);
                         }
-                        if ui.button("Read current input").clicked() {
-                            self.current_text = "Reading...".into();
-                            let target = self.target();
-                            self.spawn(&ctx, move || Msg::Current(get_input(target)));
+                    });
+                    if selected != self.selected {
+                        self.selected = selected;
+                        self.set_capture(None);
+                    }
+                    if let Some(choice) = add {
+                        self.add_monitor(&ctx, choice.as_ref());
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let only_one = self.drafts.len() <= 1;
+                        if ui
+                            .add_enabled(!only_one, egui::Button::new("Remove monitor"))
+                            .on_hover_text("At least one monitor is required")
+                            .clicked()
+                        {
+                            self.remove_selected();
+                        }
+                        if ui.button("Move up").clicked() {
+                            self.move_selected(true);
+                        }
+                        if ui.button("Move down").clicked() {
+                            self.move_selected(false);
                         }
                     });
-                    if !self.current_text.is_empty() {
-                        ui.label(&self.current_text);
+                    let options = self.display_options();
+                    let mut chosen = self.picker_target();
+                    let mut changed = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Detected display:");
+                        egui::ComboBox::from_id_salt("target")
+                            .width(330.0)
+                            .selected_text(
+                                options
+                                    .iter()
+                                    .find(|(_, target)| *target == chosen)
+                                    .map(|(label, _)| label.clone())
+                                    .unwrap_or_else(|| "(not detected)".into()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (label, target) in &options {
+                                    if ui
+                                        .selectable_value(&mut chosen, target.clone(), label)
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        if ui.button("Read current input").clicked() {
+                            let target = self.target();
+                            if let Some(draft) = self.drafts.get_mut(self.selected) {
+                                draft.current_text = "Reading...".into();
+                            }
+                            let draft = self.draft_id(self.selected);
+                            self.spawn(&ctx, move || Msg::Current {
+                                draft,
+                                result: get_input(target),
+                            });
+                        }
+                    });
+                    if changed {
+                        if let Some(draft) = self.drafts.get_mut(self.selected) {
+                            draft.name = clean_target_part(&chosen.0);
+                            draft.device = clean_target_part(&chosen.1);
+                            draft.current_text.clear();
+                            draft.inputs_text.clear();
+                        }
+                    }
+                    if let Some(error) = &self.displays_error {
+                        ui.label(error);
+                    }
+                    if let Some(draft) = self.drafts.get(self.selected) {
+                        if !draft.current_text.is_empty() {
+                            ui.label(&draft.current_text);
+                        }
                     }
                 });
 
+                let selected = self.selected;
+                let draft_id = self.draft_id(selected);
+                let target = self.target();
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.strong("Inputs");
                     let mut remove = None;
-                    egui::Grid::new("inputs").num_columns(6).spacing([8.0, 6.0]).show(ui, |ui| {
-                        for h in ["Name", "Value", "Shortcut", "In Next", "", ""] {
-                            ui.strong(h);
-                        }
-                        ui.end_row();
-                        for i in 0..self.rows.len() {
-                            ui.add_sized([160.0, 22.0], egui::TextEdit::singleline(&mut self.rows[i].name));
-                            let standard = ddc::input_name(self.rows[i].value);
-                            ui.add(egui::DragValue::new(&mut self.rows[i].value).range(0..=0xFFFF))
-                                .on_hover_text(format!("Standard name for this code: {standard} (your monitor may label it differently)"));
-                            self.hotkey_button(ui, Capture::Row(i));
-                            ui.checkbox(&mut self.rows[i].in_next, "").on_hover_text(
-                                "Include this input when cycling with \"Next input\". Untick inputs with nothing plugged in.",
-                            );
-                            let testing = self.rows[i].testing;
-                            if ui.add_enabled(!testing, egui::Button::new("Switch now")).clicked() {
-                                self.rows[i].testing = true;
-                                let (target, value) = (self.target(), self.rows[i].value);
-                                self.spawn(&ctx, move || Msg::Tested(i, set_input(target, value)));
-                            }
-                            if ui.button("Remove").clicked() {
-                                remove = Some(i);
+                    let rows = self
+                        .drafts
+                        .get(selected)
+                        .map_or(0, |draft| draft.inputs.len());
+                    egui::Grid::new("inputs")
+                        .num_columns(6)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            for header in ["Name", "Value", "Shortcut", "In Next", "", ""] {
+                                ui.strong(header);
                             }
                             ui.end_row();
-                        }
-                    });
+                            for i in 0..rows {
+                                {
+                                    let draft = &mut self.drafts[selected];
+                                    ui.add_sized(
+                                        [160.0, 22.0],
+                                        egui::TextEdit::singleline(&mut draft.inputs[i].name),
+                                    );
+                                    let standard = ddc::input_name(draft.inputs[i].value);
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.inputs[i].value)
+                                            .range(0..=0xFFFF),
+                                    )
+                                    .on_hover_text(format!(
+                                        "Standard name for this code: {standard} (your monitor may label it differently)"
+                                    ));
+                                }
+                                self.hotkey_button(ui, Capture::Row(i));
+                                let mut switch_now = false;
+                                {
+                                    let draft = &mut self.drafts[selected];
+                                    ui.checkbox(&mut draft.inputs[i].in_next, "").on_hover_text(
+                                        "Include this input when cycling with \"Next input\". Untick inputs with nothing plugged in.",
+                                    );
+                                    let testing = draft.inputs[i].testing;
+                                    if ui
+                                        .add_enabled(!testing, egui::Button::new("Switch now"))
+                                        .clicked()
+                                    {
+                                        draft.inputs[i].testing = true;
+                                        switch_now = true;
+                                    }
+                                    if ui.button("Remove").clicked() {
+                                        remove = Some(i);
+                                    }
+                                }
+                                if switch_now {
+                                    let value = self.drafts[selected].inputs[i].value;
+                                    let target = target.clone();
+                                    self.spawn(&ctx, move || Msg::Tested {
+                                        draft: draft_id,
+                                        row: i,
+                                        result: set_input(target, value),
+                                    });
+                                }
+                                ui.end_row();
+                            }
+                        });
                     if let Some(i) = remove {
-                        self.rows.remove(i);
+                        self.drafts[selected].inputs.remove(i);
                         self.set_capture(None);
                     }
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("Add input").clicked() {
-                            self.rows.push(Row { name: "New input".into(), value: 0, hotkey: None, in_next: true, testing: false });
+                            self.drafts[selected].inputs.push(Row {
+                                name: "New input".into(),
+                                value: 0,
+                                hotkey: None,
+                                in_next: true,
+                                testing: false,
+                            });
                         }
-                        let detect = egui::Button::new(if self.detecting { "Detecting..." } else { "Detect inputs" });
+                        let detecting = self
+                            .drafts
+                            .get(selected)
+                            .is_some_and(|draft| draft.detecting);
+                        let detect = egui::Button::new(if detecting {
+                            "Detecting..."
+                        } else {
+                            "Detect inputs"
+                        });
                         if ui
-                            .add_enabled(!self.detecting, detect)
-                            .on_hover_text("Ask the selected monitor which inputs it has, and add the missing ones")
+                            .add_enabled(!detecting, detect)
+                            .on_hover_text(
+                                "Ask the selected monitor which inputs it has, and add the missing ones",
+                            )
                             .clicked()
                         {
-                            self.detecting = true;
-                            self.inputs_text.clear();
-                            let target = self.target();
-                            self.spawn(&ctx, move || Msg::Capabilities(capabilities(target)));
+                            if let Some(draft) = self.drafts.get_mut(selected) {
+                                draft.detecting = true;
+                                draft.inputs_text.clear();
+                            }
+                            let target = target.clone();
+                            self.spawn(&ctx, move || Msg::Capabilities {
+                                draft: draft_id,
+                                result: capabilities(target),
+                            });
                         }
                     });
-                    if !self.inputs_text.is_empty() {
-                        ui.label(&self.inputs_text);
+                    if let Some(draft) = self.drafts.get(selected) {
+                        if !draft.inputs_text.is_empty() {
+                            ui.label(&draft.inputs_text);
+                        }
                     }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Next-input shortcut (this monitor):");
+                        self.hotkey_button(ui, Capture::Toggle);
+                    });
                     ui.weak(format!(
                         "Click a name to rename it. Value = the input code (VCP 0x60) sent to the monitor; hover it for the standard name. \
-                         \"Next input\" only cycles through inputs ticked In Next.{}",
+                         Each monitor has its own input list and Next shortcut. \"Next input\" only cycles through inputs ticked In Next.{}",
                         platform::SHORTCUTS_HINT
                     ));
                 });
@@ -717,10 +1100,6 @@ impl eframe::App for SettingsApp {
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.strong("Options");
-                    ui.horizontal(|ui| {
-                        ui.label("Next-input shortcut (cycles through the list):");
-                        self.hotkey_button(ui, Capture::Toggle);
-                    });
                     ui.checkbox(&mut self.autostart, platform::START_WITH_LOGIN);
                     ui.checkbox(&mut self.notifications, "Show a notification after switching");
                     ui.checkbox(
@@ -752,8 +1131,8 @@ pub fn run() -> i32 {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("{APP_NAME} - Settings"))
         .with_app_id(crate::config::APP_ID)
-        .with_inner_size([800.0, 470.0])
-        .with_min_inner_size([700.0, 400.0]);
+        .with_inner_size([820.0, 520.0])
+        .with_min_inner_size([720.0, 420.0]);
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }

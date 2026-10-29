@@ -57,4 +57,4 @@ fi
 
 nohup "$BIN" >/dev/null 2>&1 &
 echo "Installed to $BIN. Monitor Input Switcher is running in the system tray."
-echo "CLI: $APP switch <name|code> | next | get | list | capabilities | settings | quit"
+echo "CLI: $APP switch <name|code> [--monitor <N|NAME|DEVICE>] | next | get | list | monitors | capabilities | settings | quit"

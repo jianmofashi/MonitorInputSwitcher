@@ -13,16 +13,18 @@ to the monitor directly and switches in a fraction of a second.
 
 It runs on Windows and Linux (KDE Plasma). I built and tested it on my own screen, but nothing in it
 is specific to that model: it should work with any monitor that implements DDC/CI. On first run it
-asks the monitor which inputs it has and sets itself up from that.
+asks each connected monitor which inputs it has and sets itself up from that. Several monitors can be
+configured independently: each one has its own inputs, shortcuts and "Next input" action.
 
 ## Screenshots
 
-The tray menu: the current input is checked, and each input shows its shortcut.
+The tray menu with one monitor configured: the current input is checked, and each input shows its
+shortcut. With several monitors configured, each monitor gets its own submenu.
 
 ![Tray menu on Windows, with one item per input and its shortcut](docs/screenshots/System-Tray.png)
 
-The Settings window: pick the monitor, name the inputs, set their shortcuts and choose which ones
-"Next input" cycles through.
+The Settings window: pick a monitor, name its inputs, set their shortcuts and choose which ones
+"Next input" cycles through. Monitors can be added, removed and reordered.
 
 ![Settings window on Windows, with the monitor picker, the inputs table and the options](docs/screenshots/Settings-ui.png)
 
@@ -48,28 +50,34 @@ window (egui) and the command line are shared; only the platform layer differs:
 
 ## What it does
 
-- **Tray menu** (left- or right-click the icon): the monitor's name, one item per input (the
+- **Tray menu** (left- or right-click the icon): with one monitor, its name, one item per input (the
   current one is checked, with its shortcut next to it), Next input, Settings..., Start with login
-  (Start with Windows on Windows), and Exit.
-- **Global shortcuts**, changeable in Settings: `Ctrl+Alt+Shift+1`, `+2`, … for the inputs in order,
-  and `Ctrl+Alt+Shift+S` for the next input. On KDE they also show up in
-  System Settings > Keyboard > Shortcuts > Monitor Input Switcher, and both places stay in sync.
-- **Automatic setup:** on first run (or whenever no input is configured) the app finds the connected
-  monitor, reads the input codes it supports from its DDC/CI capabilities, and creates one input per
-  code, named from the MCCS standard (DisplayPort, HDMI-1, USB-C, …). On mine that gives
-  DisplayPort `15`, HDMI-1 `17`, HDMI-2 `18` and USB-C `27`. A notification lists what it created.
-  "Detect inputs" in Settings adds missing ones later. If your monitor doesn't report its inputs,
-  you can add them by hand.
-- **Settings window:** monitor picker, editable inputs (name, VCP value, shortcut, "In Next", and a
-  "Switch now" button to test), "Detect inputs", the next-input shortcut, start at login, and the
-  startup and switch notifications. **Export...** saves the settings to a file and **Import...**
-  loads one into the window (applied on Save), to set up another computer the same way.
-- **"Next input"** only cycles through inputs ticked **In Next** (`IncludeInNext`, on by default), so
-  you can skip the ports with nothing plugged in. Sadly, a monitor can't be asked which inputs
-  actually have a signal: DDC/CI has no standard command for it.
+  (Start with Windows on Windows), and Exit. With several monitors, each monitor is a submenu with
+  its own inputs and Next input.
+- **Global shortcuts**, changeable in Settings: `Ctrl+Alt+Shift+1`, `+2`, … for the inputs in order
+  (up to nine across all monitors when they are set up automatically), and `Ctrl+Alt+Shift+S` for
+  the first monitor's next input. Every monitor can have its own Next-input shortcut. On KDE the
+  shortcuts also show up in System Settings > Keyboard > Shortcuts > Monitor Input Switcher, and
+  both places stay in sync.
+- **Automatic setup:** on first run (or whenever no input is configured) the app finds every
+  connected monitor, reads the input codes each one supports from its DDC/CI capabilities, and
+  creates one input per code, named from the MCCS standard (DisplayPort, HDMI-1, USB-C, …). On mine
+  that gives DisplayPort `15`, HDMI-1 `17`, HDMI-2 `18` and USB-C `27`. A notification summarizes
+  what it created. "Detect inputs" in Settings adds missing ones later. If your monitor doesn't
+  report its inputs, you can add them by hand.
+- **Settings window:** a list of monitors that you can add to, remove from and reorder, with a
+  display picker for each entry; per-monitor editable inputs (name, VCP value, shortcut, "In Next",
+  and a "Switch now" button to test), "Detect inputs", and that monitor's next-input shortcut. It
+  also has start at login and the startup and switch notification options. **Export...** saves the
+  settings to a file and **Import...** loads one into the window (applied on Save), to set up another
+  computer the same way.
+- **"Next input"** is per monitor and only cycles through inputs ticked **In Next**
+  (`IncludeInNext`, on by default), so you can skip the ports with nothing plugged in. Sadly, a
+  monitor can't be asked which inputs actually have a signal: DDC/CI has no standard command for it.
 - **Notifications:** one when the app starts, so you know it's running even when the tray icon is
   tucked away in the hidden icons (it can be turned off in Settings, except on the very first run).
-  Also one after each switch (optional), and on errors (always).
+  Also one after each switch (optional, with the monitor's name when several are configured), and
+  on errors (always).
 - Only one instance runs, and it turns on start-at-login the first time it runs.
 
 Before anything else, make sure DDC/CI is turned on in your monitor's on-screen menu. Most monitors
@@ -168,6 +176,7 @@ monitor-input-switcher switch 0x11      # any input code, configured or not
 monitor-input-switcher next
 monitor-input-switcher get              # e.g. "6927 (0x1B0F) = DisplayPort"
 monitor-input-switcher list             # e.g. "AW3926QW  (/dev/i2c-20, card2-DP-8)"
+monitor-input-switcher monitors         # configured monitors, numbered; the first is the default
 monitor-input-switcher capabilities     # model and input codes the monitor reports, plus the raw string
 monitor-input-switcher settings
 monitor-input-switcher export settings.json   # save the settings to a file
@@ -175,11 +184,15 @@ monitor-input-switcher import settings.json   # replace the settings with an exp
 monitor-input-switcher quit
 ```
 
+`switch`, `next`, `get` and `capabilities` accept `--monitor` (`-m`) followed by a configured
+monitor's number, name or device, for example `switch USB-C --monitor 2` or
+`get --monitor AW3926QW`. Without it, the first configured monitor is used.
+
 On Windows it's `monitor-input-switcher.exe`, from PowerShell or cmd. The commands go to the running
 app (over `$XDG_RUNTIME_DIR/monitor-input-switcher.sock` on Linux, a named pipe on Windows), so DDC
-operations never overlap. If the app isn't running, `switch`, `next`, `get` and `list` talk to the
-monitor directly. `export` and `import` work either way; `import` has a running app reload the new
-settings.
+operations never overlap. If the app isn't running, `switch`, `next`, `get`, `list`, `monitors` and
+`capabilities` talk to the monitor directly. `export` and `import` work either way; `import` has a
+running app reload the new settings.
 
 ## Config
 
@@ -187,25 +200,43 @@ Both systems use the same JSON format:
 
 ```json
 {
-  "MonitorName": "AW3926QW",
-  "MonitorDevice": null,
-  "Inputs": [
-    { "Name": "DisplayPort", "Value": 15, "Hotkey": "Ctrl+Alt+Shift+1", "IncludeInNext": true },
-    { "Name": "HDMI-2", "Value": 18, "Hotkey": "Ctrl+Alt+Shift+2", "IncludeInNext": false },
-    { "Name": "USB-C", "Value": 27, "Hotkey": "Ctrl+Alt+Shift+3", "IncludeInNext": true }
+  "Monitors": [
+    {
+      "Name": "AW3926QW",
+      "Device": null,
+      "ToggleHotkey": "Ctrl+Alt+Shift+S",
+      "Inputs": [
+        { "Name": "DisplayPort", "Value": 15, "Hotkey": "Ctrl+Alt+Shift+1", "IncludeInNext": true },
+        { "Name": "HDMI-2", "Value": 18, "Hotkey": "Ctrl+Alt+Shift+2", "IncludeInNext": false },
+        { "Name": "USB-C", "Value": 27, "Hotkey": "Ctrl+Alt+Shift+3", "IncludeInNext": true }
+      ]
+    },
+    {
+      "Name": "U2720Q",
+      "Device": "\\\\.\\DISPLAY2",
+      "ToggleHotkey": null,
+      "Inputs": [
+        { "Name": "HDMI-1", "Value": 17, "Hotkey": "Ctrl+Alt+Shift+4", "IncludeInNext": true },
+        { "Name": "USB-C", "Value": 27, "Hotkey": null, "IncludeInNext": true }
+      ]
+    }
   ],
-  "ToggleHotkey": "Ctrl+Alt+Shift+S",
   "ShowNotifications": true,
   "ShowStartupNotification": true
 }
 ```
 
-`MonitorName` is matched against the EDID model name. `MonitorDevice` optionally narrows the match:
-`\\.\DISPLAY1` on Windows, `/dev/i2c-N` on Linux (a value from the other OS is ignored). With no
-`MonitorName`, the only (or first) DDC/CI monitor is used. `Value` is the MCCS input code (VCP `0x60`).
-The standard codes are `0x0F`/`0x10` DisplayPort-1/2, `0x11`/`0x12` HDMI-1/2, `0x03`/`0x04` DVI-1/2
-and `0x01`/`0x02` VGA-1/2; `0x1B` is commonly USB-C. The Windows key is written `Win` on Windows and
-`Meta` on Linux; both are accepted.
+Each monitor has its own `Inputs` and `ToggleHotkey`. `Name` is matched against the EDID model name.
+`Device` optionally narrows the match: `\\.\DISPLAY1` on Windows, `/dev/i2c-N` on Linux (a value from
+the other OS is ignored). With several monitors, each entry needs a `Name` or `Device` so it is
+unambiguous; two entries must not point at the same display. With no name, the only DDC/CI monitor is
+used. `Value` is the MCCS input code (VCP `0x60`). The standard codes are `0x0F`/`0x10`
+DisplayPort-1/2, `0x11`/`0x12` HDMI-1/2, `0x03`/`0x04` DVI-1/2 and `0x01`/`0x02` VGA-1/2; `0x1B` is
+commonly USB-C. The Windows key is written `Win` on Windows and `Meta` on Linux; both are accepted.
+
+A config from an older version (with `MonitorName`, `MonitorDevice`, `Inputs` and `ToggleHotkey` at
+the top level) still loads: it is treated as a single monitor and rewritten in the new format the
+next time the settings are saved.
 
 An exported settings file is this same JSON, so it can be imported on either system. "Start with
 login" isn't in it: that stays a per-computer choice.
@@ -220,10 +251,11 @@ directly, so a switch takes about 30 ms.
 | Piece | Implementation |
 |---|---|
 | DDC/CI | Raw I2C on `/dev/i2c-N`, monitor address `0x37` (VESA DDC/CI 1.1). Set input: write `51 84 03 60 <hi> <lo> <chk>`; that one write is the whole switch. Read: write `51 82 01 60 <chk>`, wait 40 ms, read the 11-byte reply and check its checksum. Commands are spaced 50 ms apart and retried up to 3 times. There's no verification after a set, since the monitor may stop answering this link once it has switched. |
-| Detection | Every I2C bus of a graphics adapter (PCI class `0x03xxxx`, skipping disconnected DRM connectors) is probed in parallel: EDID at `0x50` gives the model, and a VCP `0x60` read tells whether DDC/CI answers. This runs once at startup (~1 s on my machine, due to empty buses timing out); the bus is cached and detected again after a failure. |
-| Capabilities | Request `51 83 F3 <offset> <chk>`, read 32-byte fragments until an empty one (~1-3 s). The `vcp(...)` section lists the input codes, e.g. `60(1B 0F 11 12)`. Names come from the MCCS table (`0x0F` DisplayPort-1, `0x11` HDMI-1, …; `0x1B` USB-C is a common vendor extension). |
-| Tray | StatusNotifierItem plus dbusmenu (`ksni`). |
-| Shortcuts | KDE's `kglobalaccel` D-Bus service, the same mechanism KDE apps use. It works on Wayland and lists the shortcuts in System Settings. |
+| Detection | Every I2C bus of a graphics adapter (PCI class `0x03xxxx`, skipping disconnected DRM connectors) is probed in parallel: EDID at `0x50` gives the model, and a VCP `0x60` read tells whether DDC/CI answers. This runs at startup (~1 s on my machine, due to empty buses timing out); each configured monitor's bus is cached and detected again after a failure. |
+| Capabilities | Request `51 83 F3 <offset> <chk>`, read 32-byte fragments until an empty one (~1-3 s). The `vcp(...)` section lists the input codes, e.g. `60(1B 0F 11 12)`. Names come from the MCCS table (`0x0F` DisplayPort-1, `0x11` HDMI-1, …; `0x1B` USB-C is a common vendor extension). With several monitors, their capabilities are read in parallel. |
+| Multiple monitors | Each entry in the config is matched to its own display and keeps its own DDC channel. With more than one configured, the "only display that answers" fallback is disabled, so an unplugged monitor reports an error instead of switching a different one. |
+| Tray | StatusNotifierItem plus dbusmenu (`ksni`); one submenu per monitor when several are configured. |
+| Shortcuts | KDE's `kglobalaccel` D-Bus service, the same mechanism KDE apps use. It works on Wayland and lists the shortcuts in System Settings. Every monitor registers its own input and Next-input shortcuts. |
 | Settings window | egui, run as a child process only while open, so the tray process stays small (about 10 MB). |
 | Single instance | `flock` on `$XDG_RUNTIME_DIR/monitor-input-switcher.lock`. |
 | Notifications | `org.freedesktop.Notifications`. |
@@ -253,6 +285,11 @@ These come from my monitor; yours may behave differently, and the app tries not 
   `sudo ./scripts/setup-system.sh`.
 - **Monitor shows "[DDC not working]" in Settings**: check that DDC/CI is on in the monitor's
   on-screen menu, and on Linux with the NVIDIA driver see the note in the Linux install section.
+- **Two identical monitors cannot be told apart**: give each entry a different `Device` in Settings
+  (the detected-display picker does this), or use `monitors` / `--monitor` with the number. The app
+  refuses to save two entries that point at the same display.
+- **A switch goes to the wrong monitor**: run `monitor-input-switcher monitors` to see the configured
+  order and devices, and check that each entry's `Detected display` in Settings is the one you mean.
 - **A shortcut does nothing**: another app may already use the key. On KDE, look for it in System
   Settings > Shortcuts; the app shows a notification when kglobalaccel refuses a shortcut. On
   Windows, a notification lists the shortcuts that couldn't be registered. Shortcuts are released

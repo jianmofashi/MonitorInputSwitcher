@@ -2,7 +2,7 @@
 //! over the platform's local transport (Unix socket on Linux, named pipe on Windows).
 
 use crate::config::{AppConfig, InputEntry};
-use crate::ddc::DisplayInfo;
+use crate::ddc::{DisplayInfo, Target};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 
@@ -97,33 +97,75 @@ pub fn parse_value(arg: &str) -> Option<u32> {
 }
 
 /// An input by name (case-insensitive) or by VCP value.
-pub fn find_input<'a>(config: &'a AppConfig, arg: &str) -> Option<&'a InputEntry> {
+pub fn find_input<'a>(inputs: &'a [InputEntry], arg: &str) -> Option<&'a InputEntry> {
     let arg = arg.trim();
-    config
-        .inputs
+    inputs
         .iter()
         .find(|e| e.name.eq_ignore_ascii_case(arg))
         .or_else(|| {
             let value = parse_value(arg)?;
-            config.inputs.iter().find(|e| e.value == value)
+            inputs.iter().find(|e| e.value == value)
         })
 }
 
-pub fn inputs_text(config: &AppConfig) -> String {
-    config
-        .inputs
+pub fn inputs_text(inputs: &[InputEntry]) -> String {
+    if inputs.is_empty() {
+        return "none".into();
+    }
+    inputs
         .iter()
         .map(|e| format!("{} ({})", e.name, e.value))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-pub fn describe_input(config: &AppConfig, value: u32) -> String {
-    let name = config
-        .inputs
-        .iter()
-        .find(|e| crate::ddc::matches(value, e.value));
+pub fn describe_input(config: &AppConfig, target: &Option<Target>, value: u32) -> String {
+    let inputs: &[InputEntry] = match config.monitor_for_target(target) {
+        Some(i) => &config.monitors[i].inputs,
+        None => &[],
+    };
+    let name = if inputs.is_empty() {
+        config
+            .monitors
+            .iter()
+            .flat_map(|m| m.inputs.iter())
+            .find(|e| crate::ddc::matches(value, e.value))
+    } else {
+        inputs
+            .iter()
+            .find(|e| crate::ddc::matches(value, e.value))
+    };
     format!("{value} (0x{value:02X})") + &name.map(|e| format!(" = {}", e.name)).unwrap_or_default()
+}
+
+/// The configured monitors: default marker, number, label, device and input count.
+pub fn monitors_text(config: &AppConfig) -> String {
+    if config.monitors.is_empty() {
+        return "No monitors configured".into();
+    }
+    config
+        .monitors
+        .iter()
+        .enumerate()
+        .map(|(i, monitor)| {
+            let label = monitor.label(i);
+            let device = monitor
+                .device
+                .as_deref()
+                .filter(|d| !d.trim().is_empty())
+                .filter(|d| *d != label)
+                .map(|d| format!("  ({d})"))
+                .unwrap_or_default();
+            let n = monitor.inputs.len();
+            format!(
+                "{} {}. {label}{device}  {n} input{}",
+                if i == 0 { "*" } else { " " },
+                i + 1,
+                if n == 1 { "" } else { "s" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn displays_text(displays: &[DisplayInfo]) -> String {
@@ -151,4 +193,47 @@ pub fn caps_text(caps: &str) -> String {
             .join("\n")
     };
     format!("Model: {model}\nInputs (VCP 0x60):\n{inputs}\nRaw: {caps}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MonitorConfig;
+
+    fn config() -> AppConfig {
+        AppConfig {
+            monitors: vec![
+                MonitorConfig::new(
+                    Some("A".into()),
+                    Some("/dev/i2c-20".into()),
+                    vec![InputEntry::new("DisplayPort", 15, None)],
+                    None,
+                ),
+                MonitorConfig::new(
+                    Some("B".into()),
+                    Some("/dev/i2c-21".into()),
+                    vec![InputEntry::new("HDMI-1", 17, None)],
+                    None,
+                ),
+            ],
+            show_notifications: true,
+            show_startup_notification: true,
+        }
+    }
+
+    #[test]
+    fn describes_the_selected_monitor() {
+        let config = config();
+        let target = Some((Some("B".into()), Some("/dev/i2c-21".into())));
+        assert!(describe_input(&config, &target, 17).contains("= HDMI-1"));
+        assert!(!describe_input(&config, &target, 15).contains("= DisplayPort"));
+    }
+
+    #[test]
+    fn lists_configured_monitors() {
+        let text = monitors_text(&config());
+        assert!(text.starts_with("* 1. A  (/dev/i2c-20)  1 input\n"));
+        assert!(text.contains("2. B  (/dev/i2c-21)  1 input"));
+        assert_eq!(monitors_text(&AppConfig::default()), "No monitors configured");
+    }
 }

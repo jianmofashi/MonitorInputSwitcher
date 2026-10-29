@@ -7,8 +7,24 @@
 
 use crate::platform::ddc::{self, Bus};
 
+/// What a configured monitor is matched by: EDID model name and/or platform device id.
+pub type Target = (Option<String>, Option<String>);
+
+/// Whether two targets refer to the same monitor. Names compare exactly; a device id from the
+/// other OS is ignored (it is not a valid device here).
+pub fn target_matches(a: &Target, b: &Target) -> bool {
+    a.0 == b.0 && target_device(a) == target_device(b)
+}
+
+fn target_device(target: &Target) -> Option<&str> {
+    target
+        .1
+        .as_deref()
+        .filter(|device| ddc::is_device(device))
+}
+
 /// Every display the platform can see, including ones whose DDC/CI channel does not answer.
-pub use crate::platform::ddc::list_displays;
+pub use crate::platform::ddc::{is_device, list_displays, open};
 use serde::{Deserialize, Serialize};
 
 pub const INPUT_VCP: u8 = 0x60;
@@ -169,6 +185,8 @@ pub struct Monitor {
     /// other OS is ignored.
     pub device: Option<String>,
     channel: Option<Bus>,
+    /// With several configured monitors, never fall back to "the only display that answers".
+    strict: bool,
 }
 
 impl Monitor {
@@ -178,6 +196,20 @@ impl Monitor {
             name,
             device,
             channel: None,
+            strict: false,
+        }
+    }
+
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.set_strict(strict);
+        self
+    }
+
+    pub fn set_strict(&mut self, strict: bool) {
+        if self.strict != strict {
+            self.strict = strict;
+            // A channel resolved with the old fallback rules may point at another monitor.
+            self.channel = None;
         }
     }
 
@@ -205,15 +237,41 @@ impl Monitor {
                 pool.iter().copied().filter(|d| &d.bus == device).collect();
             if !narrowed.is_empty() {
                 candidates = narrowed;
+            } else if self.strict && candidates.len() > 1 {
+                // A configured device disappeared and several identical models are connected:
+                // picking one would risk switching the wrong monitor.
+                let found: Vec<&str> = candidates.iter().map(|d| d.bus.as_str()).collect();
+                return Err(format!(
+                    "{} matches more than one display ({}), and its configured device {device} is not connected",
+                    self.name.as_deref().unwrap_or("Monitor"),
+                    found.join(", ")
+                ));
             }
         }
-        // A single DDC-capable display: use it, unless the named monitor is present but broken.
-        if candidates.is_empty() && valid.len() == 1 && !displays.iter().any(|d| by_name(&d)) {
-            candidates = valid.clone();
+        if self.strict && self.device.is_none() && candidates.len() > 1 {
+            // Without a device, two identical models are ambiguous in a multi-monitor config.
+            let found: Vec<&str> = candidates.iter().map(|d| d.bus.as_str()).collect();
+            return Err(format!(
+                "{} matches more than one display ({}); set its device in Settings",
+                self.name.as_deref().unwrap_or("Monitor"),
+                found.join(", ")
+            ));
         }
-        // No monitor configured at all: the first one that answers DDC/CI.
-        if candidates.is_empty() && name.is_empty() && self.device.is_none() {
-            candidates = valid.iter().take(1).copied().collect();
+        if candidates.is_empty() && !self.strict {
+            // A single DDC-capable display: use it, unless the named monitor is present but broken.
+            if valid.len() == 1 && !displays.iter().any(|d| by_name(&d)) {
+                candidates = valid.clone();
+            } else if name.is_empty() && self.device.is_none() {
+                candidates = valid.iter().take(1).copied().collect();
+            }
+        }
+        if self.strict
+            && name.is_empty()
+            && self.device.is_none()
+        {
+            return Err(
+                "This monitor entry has no display selected. Open Settings and choose one.".into(),
+            );
         }
         if let Some(d) = candidates.first() {
             return ddc::open(&d.bus);
@@ -316,5 +374,36 @@ mod tests {
         assert!(matches(0x1B0F, 15) && !matches(0x1B0F, 27));
         assert!(matches(0x0F0F, 15));
         assert!(matches(27, 27));
+    }
+
+    #[test]
+    fn targets() {
+        #[cfg(windows)]
+        const DEVICE: &str = r"\\.\DISPLAY1";
+        #[cfg(target_os = "linux")]
+        const DEVICE: &str = "/dev/i2c-20";
+        #[cfg(windows)]
+        const OTHER_OS: &str = "/dev/i2c-20";
+        #[cfg(target_os = "linux")]
+        const OTHER_OS: &str = r"\\.\DISPLAY1";
+
+        assert!(target_matches(
+            &(Some("A".into()), Some(DEVICE.into())),
+            &(Some("A".into()), Some(DEVICE.into()))
+        ));
+        // A valid device and no device are different targets.
+        assert!(!target_matches(
+            &(Some("A".into()), Some(DEVICE.into())),
+            &(Some("A".into()), None)
+        ));
+        // A device id from the other OS is ignored.
+        assert!(target_matches(
+            &(Some("A".into()), Some(OTHER_OS.into())),
+            &(Some("A".into()), None)
+        ));
+        assert!(!target_matches(
+            &(Some("A".into()), None),
+            &(Some("B".into()), None)
+        ));
     }
 }

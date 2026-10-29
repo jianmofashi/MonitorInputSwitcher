@@ -2,11 +2,11 @@
 //! operations never overlap and never block the menu.
 
 use crate::autoconfig;
-use crate::config::{APP_NAME, AppConfig, InputEntry, Loaded, autostart};
-use crate::ddc::{self, Monitor};
+use crate::config::{APP_NAME, AppConfig, InputEntry, Loaded, MonitorConfig, autostart};
+use crate::ddc::{self, Monitor, Target};
 use crate::hotkey::Hotkey;
 use crate::ipc::{self, Request, Response};
-use crate::platform::{self, ShortcutAction, TrayModel, Ui, UiEvent};
+use crate::platform::{self, ShortcutAction, TrayModel, TrayMonitor, Ui, UiEvent};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -19,9 +19,10 @@ enum Ev {
     Ui(UiEvent),
     SettingsClosed,
     Ipc(Request, Reply),
-    InputKnown(u32),
-    AutoConfigured(Result<autoconfig::Detected, String>),
+    InputsKnown(Vec<(Target, u32)>),
+    AutoConfigured(Result<Vec<autoconfig::Detected>, String>),
     SwitchDone {
+        target: Target,
         entry: Option<InputEntry>,
         result: Result<InputEntry, String>,
         reply: Option<Reply>,
@@ -29,32 +30,66 @@ enum Ev {
     },
 }
 
-fn input_action_id(index: usize) -> String {
-    format!("switch-input-{}", index + 1)
+/// The monitor/input a global shortcut belongs to.
+#[derive(Clone, Copy)]
+enum ActionTarget {
+    Switch { monitor: usize, input: usize },
+    Next { monitor: usize },
+}
+
+struct ActionSpec {
+    id: String,
+    friendly: String,
+    hotkey: Option<String>,
+    target: ActionTarget,
+}
+
+fn input_action_id(monitor: usize, input: usize, single: bool) -> String {
+    if single {
+        // Keep the pre-multi-monitor ids: KDE stores user customisations by action id.
+        format!("switch-input-{}", input + 1)
+    } else {
+        format!("switch-input-{}-{}", monitor + 1, input + 1)
+    }
+}
+
+fn toggle_action_id(monitor: usize, single: bool) -> String {
+    if single {
+        TOGGLE_ACTION.into()
+    } else {
+        format!("{TOGGLE_ACTION}-{}", monitor + 1)
+    }
 }
 
 // --- DDC worker ----------------------------------------------------------------------------------
 
-/// The configured monitor plus any monitor the Settings window is trying out, with cached buses.
+/// Monitors cached by target. Settings may try displays that are not saved yet, so this is not
+/// tied to the configured monitor list.
 struct Monitors {
-    current: Monitor,
-    others: Vec<Monitor>,
+    cached: Vec<Monitor>,
+    strict: bool,
 }
 
 impl Monitors {
-    fn get(&mut self, target: Option<(Option<String>, Option<String>)>) -> &mut Monitor {
-        let Some((name, device)) = target else {
-            return &mut self.current;
-        };
-        if self.current.is(&name, &device) {
-            return &mut self.current;
-        }
-        match self.others.iter().position(|m| m.is(&name, &device)) {
-            Some(i) => &mut self.others[i],
+    fn get(&mut self, target: Option<Target>) -> &mut Monitor {
+        let (name, device) = target.unwrap_or_default();
+        let index = match self.cached.iter().position(|m| m.is(&name, &device)) {
+            Some(i) => i,
             None => {
-                self.others.push(Monitor::new(name, device));
-                self.others.last_mut().unwrap()
+                self.cached.push(Monitor::new(name, device));
+                self.cached.len() - 1
             }
+        };
+        let strict = self.strict;
+        let monitor = &mut self.cached[index];
+        monitor.set_strict(strict);
+        monitor
+    }
+
+    fn set_strict(&mut self, strict: bool) {
+        self.strict = strict;
+        for monitor in &mut self.cached {
+            monitor.set_strict(strict);
         }
     }
 }
@@ -64,13 +99,16 @@ type Job = Box<dyn FnOnce(&mut Monitors) + Send>;
 fn spawn_ddc_worker(config: &AppConfig) -> Sender<Job> {
     let (tx, rx) = mpsc::channel::<Job>();
     let mut monitors = Monitors {
-        current: Monitor::new(config.monitor_name.clone(), config.monitor_device.clone()),
-        others: Vec::new(),
+        cached: Vec::new(),
+        strict: config.monitors.len() > 1,
     };
+    let first = config.monitors.first().map(MonitorConfig::target);
     thread::Builder::new()
         .name("ddc".into())
         .spawn(move || {
-            monitors.current.warm_up();
+            if let Some(target) = first {
+                monitors.get(Some(target)).warm_up();
+            }
             for job in rx {
                 job(&mut monitors);
             }
@@ -83,7 +121,9 @@ fn spawn_ddc_worker(config: &AppConfig) -> Sender<Job> {
 
 struct App {
     config: AppConfig,
-    last_known: Option<u32>,
+    /// Current input by configured monitor index, when known.
+    last_known: Vec<Option<u32>>,
+    refreshing: bool,
     tx: Sender<Ev>,
     ddc: Sender<Job>,
     ui: Ui,
@@ -137,10 +177,12 @@ pub fn run() -> i32 {
         }
     };
 
+    let last_known = vec![None; config.monitors.len()];
     let mut app = App {
         ddc: spawn_ddc_worker(&config),
         config,
-        last_known: None,
+        last_known,
+        refreshing: false,
         tx: tx.clone(),
         ui,
         hotkey_busy: false,
@@ -164,8 +206,8 @@ pub fn run() -> i32 {
 
     if let Some(e) = load_error {
         app.notify_error("Settings not loaded", &e);
-    } else if app.config.inputs.is_empty() {
-        // First run (or nothing configured): set up whatever monitor is connected. Its
+    } else if app.config.monitors.iter().all(|m| m.inputs.is_empty()) {
+        // First run (or nothing configured): set up whatever monitors are connected. Its
         // notification also says the app is running.
         app.start_autoconfig();
     } else if app.config.show_startup_notification || first_run {
@@ -175,8 +217,21 @@ pub fn run() -> i32 {
         let mut body =
             "Running in the system tray: click its icon to switch input or open Settings."
                 .to_string();
-        if let Some(hk) = Hotkey::parse_opt(&app.config.toggle_hotkey) {
-            body.push_str(&format!(" {hk} switches to the next input."));
+        if let Some(hk) = app
+            .config
+            .monitors
+            .first()
+            .and_then(|m| m.toggle_hotkey.as_deref())
+            .and_then(Hotkey::parse)
+        {
+            body.push_str(&format!(
+                " {hk} switches to the next input{}.",
+                if app.config.monitors.len() > 1 {
+                    " of the first monitor"
+                } else {
+                    ""
+                }
+            ));
         }
         if first_run {
             body.push_str(" It will also start at login.");
@@ -195,13 +250,15 @@ impl App {
     fn event_loop(&mut self, rx: Receiver<Ev>) {
         for ev in rx {
             match ev {
-                Ev::Ui(UiEvent::Switch(i)) => self.switch(i, None, false),
-                Ev::Ui(UiEvent::Next) => self.next_input(None, false),
+                Ev::Ui(UiEvent::Switch { monitor, input }) => {
+                    self.switch(monitor, input, None, false)
+                }
+                Ev::Ui(UiEvent::Next { monitor }) => self.next_input(monitor, None, false),
                 Ev::Ui(UiEvent::Hotkey(action)) => self.on_hotkey(&action),
                 Ev::Ui(UiEvent::HotkeyChanged(action, hotkey)) => {
                     self.on_hotkey_changed(&action, hotkey)
                 }
-                Ev::Ui(UiEvent::MenuOpened) => self.refresh_current_input(),
+                Ev::Ui(UiEvent::MenuOpened) => self.refresh_current_inputs(),
                 Ev::Ui(UiEvent::SetAutostart(on)) => {
                     if let Err(e) = autostart::set_enabled(on) {
                         self.notify_error("Could not change startup setting", &e.to_string());
@@ -221,16 +278,14 @@ impl App {
                         break;
                     }
                 }
-                Ev::InputKnown(v) => {
-                    self.last_known = Some(v);
-                    self.update_tray();
-                }
+                Ev::InputsKnown(values) => self.inputs_known(values),
                 Ev::SwitchDone {
+                    target,
                     entry,
                     result,
                     reply,
                     from_hotkey,
-                } => self.switch_done(entry, result, reply, from_hotkey),
+                } => self.switch_done(target, entry, result, reply, from_hotkey),
                 Ev::AutoConfigured(result) => self.autoconfigured(result),
             }
         }
@@ -238,28 +293,36 @@ impl App {
 
     fn update_tray(&self) {
         let cfg = &self.config;
-        let header = format!(
-            "Monitor: {}",
-            cfg.monitor_name
-                .as_deref()
-                .or(cfg.monitor_device.as_deref())
-                .unwrap_or("(auto)")
-        );
-        let inputs: Vec<_> = cfg
-            .inputs
+        let labels = cfg.monitor_labels();
+        let monitors = cfg
+            .monitors
             .iter()
-            .map(|e| {
-                (
-                    e.name.clone(),
-                    Hotkey::parse_opt(&e.hotkey),
-                    self.last_known.is_some_and(|v| ddc::matches(v, e.value)),
-                )
+            .enumerate()
+            .map(|(i, monitor)| TrayMonitor {
+                label: labels
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Monitor {}", i + 1)),
+                inputs: monitor
+                    .inputs
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.name.clone(),
+                            Hotkey::parse_opt(&e.hotkey),
+                            self.last_known
+                                .get(i)
+                                .copied()
+                                .flatten()
+                                .is_some_and(|v| ddc::matches(v, e.value)),
+                        )
+                    })
+                    .collect(),
+                toggle: Hotkey::parse_opt(&monitor.toggle_hotkey),
             })
             .collect();
         self.ui.update(TrayModel {
-            header,
-            inputs,
-            toggle: Hotkey::parse_opt(&cfg.toggle_hotkey),
+            monitors,
             autostart: autostart::is_enabled(),
         });
     }
@@ -272,28 +335,75 @@ impl App {
         let _ = self.ddc.send(Box::new(job));
     }
 
-    fn refresh_current_input(&self) {
+    fn refresh_current_inputs(&mut self) {
+        if self.refreshing {
+            return;
+        }
+        self.refreshing = true;
+        let targets: Vec<Target> = self.config.monitors.iter().map(MonitorConfig::target).collect();
         let tx = self.tx.clone();
         self.run_ddc(move |m| {
-            if let Ok(v) = m.current.get_input() {
-                let _ = tx.send(Ev::InputKnown(v)); // best-effort: no check mark on failure
+            let mut values = Vec::new();
+            for target in targets {
+                if let Ok(value) = m.get(Some(target.clone())).get_input() {
+                    values.push((target, value));
+                }
             }
+            let _ = tx.send(Ev::InputsKnown(values));
         });
+    }
+
+    fn inputs_known(&mut self, values: Vec<(Target, u32)>) {
+        self.refreshing = false;
+        for (target, value) in values {
+            if let Some(i) = self
+                .config
+                .monitors
+                .iter()
+                .position(|m| ddc::target_matches(&m.target(), &target))
+            {
+                if self.last_known.len() <= i {
+                    self.last_known.resize(i + 1, None);
+                }
+                self.last_known[i] = Some(value);
+            }
+        }
+        self.update_tray();
     }
 
     // --- switching -------------------------------------------------------------------------------
 
-    fn switch(&self, index: usize, reply: Option<Reply>, from_hotkey: bool) {
-        if let Some(entry) = self.config.inputs.get(index).cloned() {
-            self.switch_to(entry, reply, from_hotkey);
+    fn switch(&self, monitor: usize, index: usize, reply: Option<Reply>, from_hotkey: bool) {
+        let found = self
+            .config
+            .monitors
+            .get(monitor)
+            .and_then(|m| m.inputs.get(index).cloned().map(|e| (m.target(), e)));
+        match found {
+            Some((target, entry)) => self.switch_to(target, entry, reply, from_hotkey),
+            None => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Response::err("No such monitor or input"));
+                }
+            }
         }
     }
 
-    fn switch_to(&self, entry: InputEntry, reply: Option<Reply>, from_hotkey: bool) {
+    fn switch_to(
+        &self,
+        target: Target,
+        entry: InputEntry,
+        reply: Option<Reply>,
+        from_hotkey: bool,
+    ) {
         let tx = self.tx.clone();
         self.run_ddc(move |m| {
-            let result = m.current.set_input(entry.value).map(|_| entry.clone());
+            let result = m
+                .get(Some(target.clone()))
+                .set_input(entry.value)
+                .map(|_| entry.clone());
             let _ = tx.send(Ev::SwitchDone {
+                target,
                 entry: Some(entry),
                 result,
                 reply,
@@ -302,16 +412,31 @@ impl App {
         });
     }
 
-    fn next_input(&self, reply: Option<Reply>, from_hotkey: bool) {
-        let inputs = self.config.inputs.clone();
-        let last = self.last_known;
+    fn next_input(&self, monitor: usize, reply: Option<Reply>, from_hotkey: bool) {
+        let Some(profile) = self.config.monitors.get(monitor) else {
+            if let Some(reply) = reply {
+                let _ = reply.send(Response::err(format!(
+                    "No such monitor. {}",
+                    self.config.monitors_summary()
+                )));
+            }
+            return;
+        };
+        let target = profile.target();
+        let inputs = profile.inputs.clone();
+        let last = self.last_known.get(monitor).copied().flatten();
         let tx = self.tx.clone();
         self.run_ddc(move |m| {
-            let current = m.current.get_input().ok().or(last);
+            let current = m.get(Some(target.clone())).get_input().ok().or(last);
             let result = crate::config::next_input(&inputs, current)
                 .cloned()
-                .and_then(|target| m.current.set_input(target.value).map(|_| target));
+                .and_then(|next| {
+                    m.get(Some(target.clone()))
+                        .set_input(next.value)
+                        .map(|_| next)
+                });
             let _ = tx.send(Ev::SwitchDone {
+                target,
                 entry: None,
                 result,
                 reply,
@@ -322,6 +447,7 @@ impl App {
 
     fn switch_done(
         &mut self,
+        target: Target,
         entry: Option<InputEntry>,
         result: Result<InputEntry, String>,
         reply: Option<Reply>,
@@ -330,25 +456,41 @@ impl App {
         if from_hotkey {
             self.hotkey_busy = false;
         }
+        let monitor = self
+            .config
+            .monitors
+            .iter()
+            .position(|m| ddc::target_matches(&m.target(), &target));
         match result {
-            Ok(target) => {
-                self.last_known = Some(target.value);
+            Ok(switched) => {
+                if let Some(i) = monitor {
+                    if self.last_known.len() <= i {
+                        self.last_known.resize(i + 1, None);
+                    }
+                    self.last_known[i] = Some(switched.value);
+                }
                 self.update_tray();
-                let msg = format!("Switched to {}", target.name);
+                let label = monitor.and_then(|i| self.config.monitor_labels().get(i).cloned());
+                let msg = match label {
+                    Some(label) if self.config.monitors.len() > 1 => {
+                        format!("Switched to {} on {label}", switched.name)
+                    }
+                    _ => format!("Switched to {}", switched.name),
+                };
                 if self.config.show_notifications {
                     self.ui.notify("Input switched", &msg, false, 1500);
                 }
-                if let Some(r) = reply {
-                    let _ = r.send(Response::ok(msg));
+                if let Some(reply) = reply {
+                    let _ = reply.send(Response::ok(msg));
                 }
             }
             Err(e) => {
-                let title = entry.map_or("Could not switch input".to_string(), |e| {
-                    format!("Could not switch to {}", e.name)
+                let title = entry.map_or("Could not switch input".to_string(), |entry| {
+                    format!("Could not switch to {}", entry.name)
                 });
                 self.notify_error(&title, &e);
-                if let Some(r) = reply {
-                    let _ = r.send(Response::err(e));
+                if let Some(reply) = reply {
+                    let _ = reply.send(Response::err(e));
                 }
             }
         }
@@ -356,51 +498,72 @@ impl App {
 
     // --- global shortcuts ------------------------------------------------------------------------
 
-    /// (action id, friendly name, hotkey) for every shortcut the app owns.
-    fn hotkey_actions(&self) -> Vec<(String, String, Option<String>)> {
-        let mut out: Vec<_> = self
-            .config
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                (
-                    input_action_id(i),
-                    format!("Switch to {}", e.name),
-                    e.hotkey.clone(),
-                )
-            })
-            .collect();
-        if self.config.inputs.len() > 1 {
-            out.push((
-                TOGGLE_ACTION.into(),
-                "Next input".into(),
-                self.config.toggle_hotkey.clone(),
-            ));
+    /// Every shortcut the app owns, in config order.
+    fn hotkey_actions(&self) -> Vec<ActionSpec> {
+        let single = self.config.monitors.len() == 1;
+        let labels = self.config.monitor_labels();
+        let mut out = Vec::new();
+        for (monitor_index, monitor) in self.config.monitors.iter().enumerate() {
+            let label = labels
+                .get(monitor_index)
+                .cloned()
+                .unwrap_or_else(|| format!("Monitor {}", monitor_index + 1));
+            for (input_index, entry) in monitor.inputs.iter().enumerate() {
+                out.push(ActionSpec {
+                    id: input_action_id(monitor_index, input_index, single),
+                    friendly: if single {
+                        format!("Switch to {}", entry.name)
+                    } else {
+                        format!("Switch {label} to {}", entry.name)
+                    },
+                    hotkey: entry.hotkey.clone(),
+                    target: ActionTarget::Switch {
+                        monitor: monitor_index,
+                        input: input_index,
+                    },
+                });
+            }
+            if monitor.inputs.len() > 1 {
+                out.push(ActionSpec {
+                    id: toggle_action_id(monitor_index, single),
+                    friendly: if single {
+                        "Next input".into()
+                    } else {
+                        format!("Next input on {label}")
+                    },
+                    hotkey: monitor.toggle_hotkey.clone(),
+                    target: ActionTarget::Next {
+                        monitor: monitor_index,
+                    },
+                });
+            }
         }
         out
     }
 
     fn register_hotkeys(&mut self, show_errors: bool) {
-        let actions: Vec<ShortcutAction> = self
-            .hotkey_actions()
-            .into_iter()
-            .map(|(id, friendly, h)| ShortcutAction {
-                id,
-                friendly,
-                hotkey: Hotkey::parse_opt(&h),
+        let actions = self.hotkey_actions();
+        let shortcuts: Vec<ShortcutAction> = actions
+            .iter()
+            .map(|action| ShortcutAction {
+                id: action.id.clone(),
+                friendly: action.friendly.clone(),
+                hotkey: Hotkey::parse_opt(&action.hotkey),
             })
             .collect();
-        match self.ui.register_shortcuts(&actions) {
+        match self.ui.register_shortcuts(&shortcuts) {
             Ok(failed_ids) => {
-                let failed: Vec<String> = actions
+                let failed: Vec<String> = shortcuts
                     .iter()
-                    .filter(|a| failed_ids.contains(&a.id))
-                    .map(|a| {
+                    .filter(|action| failed_ids.contains(&action.id))
+                    .map(|action| {
                         format!(
                             "{} ({})",
-                            a.hotkey.as_ref().unwrap(),
-                            a.friendly.trim_start_matches("Switch to ")
+                            action
+                                .hotkey
+                                .as_ref()
+                                .map_or_else(|| "?".to_string(), Hotkey::to_string),
+                            action.friendly
                         )
                     })
                     .collect();
@@ -423,37 +586,55 @@ impl App {
         // Stuck modifiers (keyboard on the monitor's USB hub, moved by the KVM) are the platform's
         // job: Windows releases them before reporting the press, Linux needs nothing (the kernel
         // removes the device and libinput releases its keys).
-        if action == TOGGLE_ACTION {
-            self.hotkey_busy = true;
-            self.next_input(None, true);
-        } else if let Some(i) =
-            (0..self.config.inputs.len()).find(|i| input_action_id(*i) == action)
-        {
-            self.hotkey_busy = true;
-            self.switch(i, None, true);
+        let Some(spec) = self
+            .hotkey_actions()
+            .into_iter()
+            .find(|spec| spec.id == action)
+        else {
+            return;
+        };
+        match spec.target {
+            ActionTarget::Next { monitor } => {
+                self.hotkey_busy = true;
+                self.next_input(monitor, None, true);
+            }
+            ActionTarget::Switch { monitor, input } => {
+                self.hotkey_busy = true;
+                self.switch(monitor, input, None, true);
+            }
         }
     }
 
     /// The user changed one of our shortcuts outside the app (KDE System Settings): keep the
     /// config in sync.
     fn on_hotkey_changed(&mut self, action: &str, hotkey: Option<Hotkey>) {
-        let current = self
+        let Some(spec) = self
             .hotkey_actions()
             .into_iter()
-            .find(|(a, _, _)| a == action)
-            .map(|(_, _, h)| Hotkey::parse_opt(&h));
-        let Some(current) = current else { return };
-        if current == hotkey {
+            .find(|spec| spec.id == action)
+        else {
+            return;
+        };
+        if Hotkey::parse_opt(&spec.hotkey) == hotkey {
             return;
         }
         let new = hotkey.map(|h| h.to_string());
-        if action == TOGGLE_ACTION {
-            self.config.toggle_hotkey = new;
-        } else if let Some(e) = (0..self.config.inputs.len())
-            .find(|i| input_action_id(*i) == action)
-            .map(|i| &mut self.config.inputs[i])
-        {
-            e.hotkey = new;
+        match spec.target {
+            ActionTarget::Next { monitor } => {
+                if let Some(monitor) = self.config.monitors.get_mut(monitor) {
+                    monitor.toggle_hotkey = new;
+                }
+            }
+            ActionTarget::Switch { monitor, input } => {
+                if let Some(entry) = self
+                    .config
+                    .monitors
+                    .get_mut(monitor)
+                    .and_then(|m| m.inputs.get_mut(input))
+                {
+                    entry.hotkey = new;
+                }
+            }
         }
         if let Err(e) = self.config.save() {
             self.notify_error("Could not save settings", &e.to_string());
@@ -497,12 +678,12 @@ impl App {
     fn start_autoconfig(&self) {
         let tx = self.tx.clone();
         self.run_ddc(move |_| {
-            let _ = tx.send(Ev::AutoConfigured(autoconfig::detect()));
+            let _ = tx.send(Ev::AutoConfigured(autoconfig::detect_all()));
         });
     }
 
-    fn autoconfigured(&mut self, result: Result<autoconfig::Detected, String>) {
-        if !self.config.inputs.is_empty() {
+    fn autoconfigured(&mut self, result: Result<Vec<autoconfig::Detected>, String>) {
+        if self.config.monitors.iter().any(|m| !m.inputs.is_empty()) {
             return; // configured in Settings meanwhile
         }
         let detected = match result {
@@ -515,53 +696,154 @@ impl App {
                 return;
             }
         };
+        let mut monitors = Vec::new();
+        let mut notes = Vec::new();
+        let mut shortcut_index = 0usize;
+        for detected in detected {
+            let autoconfig::Detected {
+                display,
+                inputs,
+                note,
+            } = detected;
+            if inputs.is_empty() {
+                continue;
+            }
+            let inputs: Vec<InputEntry> = inputs
+                .into_iter()
+                .map(|mut entry| {
+                    entry.hotkey = autoconfig::default_hotkey(shortcut_index);
+                    shortcut_index += 1;
+                    entry
+                })
+                .collect();
+            let first = monitors.is_empty();
+            monitors.push(MonitorConfig::new(
+                (!display.model.is_empty()).then(|| display.model.clone()),
+                (!display.bus.is_empty()).then(|| display.bus.clone()),
+                inputs,
+                first.then(|| autoconfig::TOGGLE_HOTKEY.to_string()),
+            ));
+            if let Some(note) = note {
+                notes.push(format!(
+                    "{}: {note}",
+                    if display.model.is_empty() {
+                        &display.bus
+                    } else {
+                        &display.model
+                    }
+                ));
+            }
+        }
+        if monitors.is_empty() {
+            self.notify_error(
+                "No monitor set up",
+                "No monitor reported any inputs. Open Settings to configure one.",
+            );
+            return;
+        }
         let mut config = self.config.clone();
-        let display = &detected.display;
-        config.monitor_name = (!display.model.is_empty()).then(|| display.model.clone());
-        config.monitor_device = display.model.is_empty().then(|| display.bus.clone());
-        config.inputs = detected.inputs;
+        config.monitors = monitors;
+        if let Err(e) = config.check() {
+            self.notify_error("Could not save settings", &e);
+            return;
+        }
         if let Err(e) = config.save() {
             self.notify_error("Could not save settings", &e.to_string());
         }
-        let summary: Vec<String> = config
-            .inputs
-            .iter()
-            .map(|e| match &e.hotkey {
-                Some(h) => format!("{} ({h})", e.name),
-                None => e.name.clone(),
-            })
-            .collect();
-        let model = config
-            .monitor_name
-            .clone()
-            .unwrap_or_else(|| display.bus.clone());
-        self.apply_config(config);
-        let mut body = format!(
-            "Running in the system tray. Inputs: {}.",
-            summary.join(", ")
-        );
-        if let Some(note) = detected.note {
-            body = format!("{body} {note}");
+        let labels = config.monitor_labels();
+        let body = if config.monitors.len() == 1 {
+            let summary: Vec<String> = config.monitors[0]
+                .inputs
+                .iter()
+                .map(|entry| match &entry.hotkey {
+                    Some(hotkey) => format!("{} ({hotkey})", entry.name),
+                    None => entry.name.clone(),
+                })
+                .collect();
+            format!(
+                "Running in the system tray. Inputs: {}.",
+                summary.join(", ")
+            )
+        } else {
+            let summary: Vec<String> = config
+                .monitors
+                .iter()
+                .enumerate()
+                .map(|(i, monitor)| {
+                    format!(
+                        "{} ({} inputs)",
+                        labels.get(i).cloned().unwrap_or_default(),
+                        monitor.inputs.len()
+                    )
+                })
+                .collect();
+            format!(
+                "Running in the system tray. Set up {} monitors: {}. Other monitors have no default Next-input shortcut; set them in Settings.",
+                config.monitors.len(),
+                summary.join(", ")
+            )
+        };
+        let mut body = body;
+        if !notes.is_empty() {
+            body.push(' ');
+            body.push_str(&notes.join(" "));
         }
         body.push_str(" In Settings, untick \"In Next\" for inputs with nothing plugged in.");
-        self.ui
-            .notify(&format!("Set up for {model}"), &body, false, 10000);
+        let title = if config.monitors.len() == 1 {
+            format!("Set up for {}", labels.first().cloned().unwrap_or_default())
+        } else {
+            format!("Set up for {} monitors", config.monitors.len())
+        };
+        self.apply_config(config);
+        self.ui.notify(&title, &body, false, 10000);
     }
 
     fn apply_config(&mut self, config: AppConfig) {
-        if (&config.monitor_name, &config.monitor_device)
-            != (&self.config.monitor_name, &self.config.monitor_device)
-        {
-            let (name, device) = (config.monitor_name.clone(), config.monitor_device.clone());
-            self.run_ddc(move |m| {
-                m.current = Monitor::new(name, device);
-                m.current.warm_up();
-            });
-            self.last_known = None;
+        let old_targets: Vec<Target> = self
+            .config
+            .monitors
+            .iter()
+            .map(MonitorConfig::target)
+            .collect();
+        let new_targets: Vec<Target> = config.monitors.iter().map(MonitorConfig::target).collect();
+        if old_targets != new_targets {
+            let old_known = std::mem::take(&mut self.last_known);
+            let known: Vec<Option<u32>> = new_targets
+                .iter()
+                .map(|target| {
+                    self.config
+                        .monitors
+                        .iter()
+                        .position(|m| ddc::target_matches(&m.target(), target))
+                        .and_then(|i| old_known.get(i).copied().flatten())
+                })
+                .collect();
+            self.last_known = known;
+            let strict = config.monitors.len() > 1;
+            self.run_ddc(move |m| m.set_strict(strict));
+        } else if self.last_known.len() != config.monitors.len() {
+            self.last_known.resize(config.monitors.len(), None);
         }
         self.config = config;
         self.update_tray();
         self.register_hotkeys(true);
+    }
+
+    /// The monitor a request targets, or the first configured one.
+    fn default_target(&self) -> Option<Target> {
+        self.config.monitors.first().map(MonitorConfig::target)
+    }
+
+    fn requested_target(&self, requested: &Option<Target>) -> Option<Target> {
+        requested.clone().or_else(|| self.default_target())
+    }
+
+    fn profile_for_target(&self, target: &Option<Target>) -> Option<usize> {
+        let target = target.clone().or_else(|| self.default_target())?;
+        self.config
+            .monitors
+            .iter()
+            .position(|m| ddc::target_matches(&m.target(), &target))
     }
 
     /// Returns true when the app should exit.
@@ -572,49 +854,70 @@ impl App {
         match req.cmd.as_str() {
             "switch" => {
                 let arg = req.arg.unwrap_or_default();
-                match self
-                    .config
-                    .inputs
-                    .iter()
-                    .position(|e| ipc::find_input(&self.config, &arg) == Some(e))
-                {
-                    Some(i) => self.switch(i, Some(reply), false),
-                    // A raw input code that isn't configured, e.g. "switch 17".
-                    None if ipc::parse_value(&arg).is_some() => {
-                        let value = ipc::parse_value(&arg).unwrap();
-                        let entry = InputEntry::new(ddc::input_name(value), value, None);
-                        self.switch_to(entry, Some(reply), false);
+                let target = self.requested_target(&req.monitor);
+                let profile = self.profile_for_target(&target);
+                let entry = profile
+                    .and_then(|i| ipc::find_input(&self.config.monitors[i].inputs, &arg).cloned());
+                match entry {
+                    Some(entry) => {
+                        self.switch_to(target.unwrap_or_default(), entry, Some(reply), false)
                     }
+                    None => match ipc::parse_value(&arg) {
+                        // A raw input code that isn't configured, e.g. "switch 17".
+                        Some(value) => {
+                            let entry = InputEntry::new(ddc::input_name(value), value, None);
+                            self.switch_to(target.unwrap_or_default(), entry, Some(reply), false)
+                        }
+                        None => send(Response::err(format!(
+                            "No input named or valued {arg:?}. Inputs: {}",
+                            profile
+                                .map(|i| ipc::inputs_text(&self.config.monitors[i].inputs))
+                                .unwrap_or_else(|| {
+                                    if self.config.monitors.is_empty() {
+                                        "No monitors configured".into()
+                                    } else {
+                                        self.config.monitors_summary()
+                                    }
+                                })
+                        ))),
+                    },
+                }
+            }
+            "next" => {
+                let target = self.requested_target(&req.monitor);
+                match self.profile_for_target(&target) {
+                    Some(monitor) => self.next_input(monitor, Some(reply), false),
                     None => send(Response::err(format!(
-                        "No input named or valued {arg:?}. Inputs: {}",
-                        ipc::inputs_text(&self.config)
+                        "No configured monitor to advance. {}",
+                        self.config.monitors_summary()
                     ))),
                 }
             }
-            "next" => self.next_input(Some(reply), false),
             "get" => {
                 let config = self.config.clone();
-                let target = req.monitor;
+                let target = self.requested_target(&req.monitor);
                 self.run_ddc(move |m| {
-                    let _ = reply.send(match m.get(target).get_input() {
+                    let response = match m.get(target.clone()).get_input() {
                         Ok(v) => Response {
                             value: Some(v),
-                            ..Response::ok(ipc::describe_input(&config, v))
+                            ..Response::ok(ipc::describe_input(&config, &target, v))
                         },
                         Err(e) => Response::err(e),
-                    });
+                    };
+                    let _ = reply.send(response);
                 });
             }
             "caps" => {
-                let target = req.monitor;
+                let target = self.requested_target(&req.monitor);
                 self.run_ddc(move |m| {
-                    let _ = reply.send(match m.get(target).capabilities() {
+                    let response = match m.get(target).capabilities() {
                         Ok(caps) => Response {
                             caps: Some(caps.clone()),
                             ..Response::ok(ipc::caps_text(&caps))
                         },
                         Err(e) => Response::err(e),
-                    });
+                    };
+                    let _ = reply.send(response);
                 });
             }
             "set" => {
@@ -635,6 +938,7 @@ impl App {
                     Err(e) => Response::err(e),
                 });
             }),
+            "monitors" => send(Response::ok(ipc::monitors_text(&self.config))),
             "reload" => send(self.reload_config()),
             "settings" => {
                 self.open_settings();

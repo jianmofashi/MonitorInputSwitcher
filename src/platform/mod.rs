@@ -1,8 +1,9 @@
 //! Everything that differs between Linux and Windows lives behind this module. Each OS module
 //! provides the same items:
 //!
-//! - `Ui`: tray icon + menu, notifications, and global shortcuts
-//!   (`start`, `update`, `notify`, `register_shortcuts`, `suspend_shortcuts`, `shutdown`)
+//! - `Ui`: tray icon + menu (`TrayModel`, one entry per configured monitor), notifications, and
+//!   global shortcuts (`start`, `update`, `notify`, `register_shortcuts`, `suspend_shortcuts`,
+//!   `shutdown`)
 //! - `block_shortcuts_for_capture`: lets the Settings window record a combination that is in use
 //! - `ddc`: `list_displays`, `open`, `is_device`, and `Bus` (`get_vcp`, `set_vcp`, `capabilities`)
 //! - `ipc`: `instance_lock`, `connect`, `listen`, `cleanup` (single instance + CLI transport)
@@ -20,21 +21,27 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
-/// What the tray menu shows.
+/// What one configured monitor looks like in the tray.
 #[derive(Clone, Debug, Default)]
-pub struct TrayModel {
-    pub header: String,
+pub struct TrayMonitor {
+    pub label: String,
     /// (name, shortcut, checked = current input)
     pub inputs: Vec<(String, Option<Hotkey>, bool)>,
     pub toggle: Option<Hotkey>,
+}
+
+/// What the tray menu shows.
+#[derive(Clone, Debug, Default)]
+pub struct TrayModel {
+    pub monitors: Vec<TrayMonitor>,
     pub autostart: bool,
 }
 
 /// Something the user did in the tray menu or with a global shortcut.
 #[derive(Debug)]
 pub enum UiEvent {
-    Switch(usize),
-    Next,
+    Switch { monitor: usize, input: usize },
+    Next { monitor: usize },
     MenuOpened,
     SetAutostart(bool),
     OpenSettings,
